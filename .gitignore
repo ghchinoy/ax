@@ -1,5 +1,6 @@
 bin/*
 eventlog/*
+examples/**/eventlog/*
 /ax
 local_agent
 remote_agent

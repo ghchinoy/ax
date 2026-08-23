@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -343,6 +344,9 @@ func promptUser(d *internal.Display, input string) (string, bool, error) {
 		var err error
 		input, err = d.PromptForInput()
 		if err != nil {
+			if strings.Contains(err.Error(), "TTY") || strings.Contains(err.Error(), "device not configured") || errors.Is(err, io.EOF) {
+				return "", true, nil
+			}
 			return "", false, err
 		}
 	}

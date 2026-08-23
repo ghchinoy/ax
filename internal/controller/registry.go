@@ -182,6 +182,52 @@ func (r *Registry) RegisterColab(cfg config.ColabAgentConfig) error {
 	return nil
 }
 
+// RegisterAppleContainer registers an Apple Container Sandbox Agent.
+func (r *Registry) RegisterAppleContainer(cfg config.AppleContainerAgentConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := validateID(cfg.ID); err != nil {
+		return err
+	}
+
+	if _, ok := r.agents[cfg.ID]; ok {
+		return fmt.Errorf("agent %s already registered", cfg.ID)
+	}
+
+	appleAgent, err := agent.NewAppleContainerAgent(agent.AppleContainerAgentConfig{
+		ID:          cfg.ID,
+		Name:        cfg.Name,
+		Description: cfg.Description,
+		Image:       cfg.Image,
+		Mode:        cfg.Mode,
+		Port:        cfg.Port,
+		HostPort:    cfg.HostPort,
+		Command:     cfg.Command,
+		WorkDir:     cfg.WorkDir,
+		Env:         cfg.Env,
+		Volumes:     cfg.Volumes,
+		CPUs:        cfg.CPUs,
+		Memory:      cfg.Memory,
+		KeepAlive:   cfg.KeepAlive,
+		BinaryPath:  cfg.BinaryPath,
+		Metadata:    cfg.Metadata,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create apple container agent %s: %w", cfg.ID, err)
+	}
+
+	r.agents[cfg.ID] = appleAgent
+	r.agentInfo[cfg.ID] = &agent.AgentInfo{
+		ID:          cfg.ID,
+		Name:        cfg.Name,
+		Description: cfg.Description,
+		Metadata:    cfg.Metadata,
+	}
+
+	return nil
+}
+
 // Get retrieves an agent by ID.
 func (r *Registry) Get(id string) (agent.Agent, error) {
 	r.mu.RLock()

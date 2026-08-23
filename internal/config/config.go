@@ -36,9 +36,10 @@ type Config struct {
 
 // RegistryConfig allows registring agents.
 type RegistryConfig struct {
-	RemoteAgents    []RemoteAgentConfig    `yaml:"remote_agents,omitempty"`
-	ColabAgents     []ColabAgentConfig     `yaml:"colab_agents,omitempty"`
-	SubstrateAgents []SubstrateAgentConfig `yaml:"substrate_agents,omitempty"`
+	RemoteAgents         []RemoteAgentConfig         `yaml:"remote_agents,omitempty"`
+	ColabAgents          []ColabAgentConfig          `yaml:"colab_agents,omitempty"`
+	SubstrateAgents      []SubstrateAgentConfig      `yaml:"substrate_agents,omitempty"`
+	AppleContainerAgents []AppleContainerAgentConfig `yaml:"apple_container_agents,omitempty"`
 }
 
 // ATEConfig configures the ATE integration.
@@ -145,6 +146,26 @@ type ColabAgentConfig struct {
 	OutputImage     string            `yaml:"output_image,omitempty"`      // Local path to download the output image to
 	OutputDrivePath string            `yaml:"output_drive_path,omitempty"` // Google Drive path to save converted .ipynb (e.g. MyDrive/notebooks/out.ipynb)
 	Metadata        map[string]string `yaml:"metadata,omitempty"`          // Optional metadata
+}
+
+// AppleContainerAgentConfig configures an Apple Container Sandbox Agent.
+type AppleContainerAgentConfig struct {
+	ID          string            `yaml:"id"`                    // Unique agent identifier
+	Name        string            `yaml:"name"`                  // Human-readable name
+	Description string            `yaml:"description"`           // Description of agent capabilities
+	Image       string            `yaml:"image"`                 // Container image name (e.g. debian:12, ax-agent:v1)
+	Mode        string            `yaml:"mode,omitempty"`        // "service" or "sandbox" / "exec"
+	Port        int               `yaml:"port,omitempty"`        // Container gRPC port for service mode
+	HostPort    int               `yaml:"host_port,omitempty"`   // Host port to map (0 for auto-allocated)
+	Command     []string          `yaml:"command,omitempty"`     // Command or entrypoint arguments
+	WorkDir     string            `yaml:"work_dir,omitempty"`    // Working directory inside container
+	Env         map[string]string `yaml:"env,omitempty"`         // Environment variables
+	Volumes     []string          `yaml:"volumes,omitempty"`     // Volumes (e.g. "hostPath:containerPath")
+	CPUs        int               `yaml:"cpus,omitempty"`        // CPUs allocation
+	Memory      string            `yaml:"memory,omitempty"`      // Memory limit (e.g. "1024M", "2G")
+	KeepAlive   bool              `yaml:"keep_alive,omitempty"`  // Preserve container across turns in a conversation
+	BinaryPath  string            `yaml:"binary_path,omitempty"` // Path to container CLI binary
+	Metadata    map[string]string `yaml:"metadata,omitempty"`    // Optional metadata
 }
 
 type LocalAgentConfig struct {

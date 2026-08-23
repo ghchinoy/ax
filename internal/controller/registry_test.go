@@ -73,3 +73,43 @@ func TestRegistry_GracefulShutdown(t *testing.T) {
 	// We are testing for absence of panic/deadlock here.
 	_ = r.Close()
 }
+
+func TestRegistry_RegisterAppleContainer(t *testing.T) {
+	r := NewRegistry()
+
+	err := r.RegisterAppleContainer(config.AppleContainerAgentConfig{
+		ID:          "apple-sandbox",
+		Name:        "Apple Sandbox",
+		Description: "Sandbox running in Apple container",
+		Image:       "debian:12",
+		Mode:        "sandbox",
+	})
+	if err != nil {
+		t.Fatalf("failed to register apple container agent: %v", err)
+	}
+
+	ag, err := r.Get("apple-sandbox")
+	if err != nil {
+		t.Fatalf("failed to get registered agent: %v", err)
+	}
+	if ag == nil {
+		t.Fatal("agent is nil")
+	}
+
+	info, err := r.GetInfo("apple-sandbox")
+	if err != nil {
+		t.Fatalf("failed to get agent info: %v", err)
+	}
+	if info.Name != "Apple Sandbox" {
+		t.Errorf("expected name 'Apple Sandbox', got %q", info.Name)
+	}
+
+	// Duplicate registration should fail
+	err = r.RegisterAppleContainer(config.AppleContainerAgentConfig{
+		ID:    "apple-sandbox",
+		Image: "debian:12",
+	})
+	if err == nil {
+		t.Error("expected error on duplicate ID registration")
+	}
+}

@@ -94,5 +94,11 @@ func NewControllerFromConfig(ctx context.Context, cfg *config.Config) (*controll
 		}
 	}
 
+	for _, agentCfg := range cfg.Registry.AppleContainerAgents {
+		if err := c.Registry().RegisterAppleContainer(agentCfg); err != nil {
+			return nil, fmt.Errorf("failed to register apple container agent %s: %w", agentCfg.ID, err)
+		}
+	}
+
 	return c, nil
 }
