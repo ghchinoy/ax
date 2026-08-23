@@ -11,6 +11,8 @@ build:
 	@echo "Building ax..."
 	@mkdir -p bin
 	@go build -o bin/ax ./cmd/ax
+	@echo "Building ate-local..."
+	@go build -o bin/ate-local ./cmd/ate-local
 	@echo "Building remote agent example..."
 	@go build -o bin/remote_agent ./examples/remote_agent
 	@echo "Build complete!"
@@ -52,6 +54,10 @@ install-ate:
 # Run remote agent example
 run-remote:
 	@go run ./examples/remote_agent
+
+# Run ate-local substrate daemon
+run-ate-local:
+	@go run ./cmd/ate-local --config ./examples/ate_local/ate-local.yaml
 
 # Install dependencies
 deps:
