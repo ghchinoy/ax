@@ -30,8 +30,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "1. Building ate-local daemon..."
+echo "1. Building ate-local daemon and linux/arm64 worker..."
+mkdir -p bin/linux_arm64
 go build -o bin/ate-local ./cmd/ate-local
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux_arm64/ate-worker ./examples/ate_local/worker/main.go
 
 echo "2. Cleaning up port 50051 if in use..."
 kill -9 $(lsof -t -i:50051) 2>/dev/null || true
@@ -44,4 +46,4 @@ echo "Waiting for ate-local to listen on :50051..."
 sleep 2
 
 echo "4. Running Substrate Control client demo..."
-go run ./examples/ate_local/demo_client.go --actor demo-actor-live --template default
+go run ./examples/ate_local/demo_client.go --actor demo-actor-live --template ax-harness-demo-template

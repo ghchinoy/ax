@@ -25,10 +25,13 @@ templates:
     cpus: 2
     memory: "1024M"
 
-  # Demo harness template
+  # Demo worker template (runs ate-worker serving /readyz on :80 and gRPC Health on :50053)
   ax-harness-demo-template:
-    image: "ax-harness-demo:latest"
+    image: "debian:12"
     port: 50053
+    command: ["/usr/local/bin/ate-worker"]
+    volumes:
+      - "./bin/linux_arm64/ate-worker:/usr/local/bin/ate-worker"
     cpus: 2
     memory: "1024M"
     env:
