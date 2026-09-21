@@ -18,8 +18,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -90,13 +93,19 @@ func main() {
 	}
 
 	// 3. Check connectivity to worker IP directly on macOS vmnet bridge
-	fmt.Printf("4. Probing worker IP connectivity directly at %s:50053...\n", workerIP)
+	fmt.Printf("4. Probing worker HTTP /readyz (%s:80) and gRPC (%s:50053) over vmnet...\n", workerIP, workerIP)
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	if resp, err := httpClient.Get(fmt.Sprintf("http://%s:80/readyz", workerIP)); err == nil {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		fmt.Printf("   HTTP /readyz response from %s:80 -> %d (%s)\n", workerIP, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:50053", workerIP), 2*time.Second)
 	if err != nil {
-		fmt.Printf("   [Note: port 50053 not yet listening on base image %q, but container network %s is verified!]\n", *template, workerIP)
+		fmt.Printf("   [Note: port 50053 not listening on template %q, but container network %s is verified!]\n", *template, workerIP)
 	} else {
 		_ = conn.Close()
-		fmt.Printf("   Successfully reached worker port at %s:50053 directly!\n", workerIP)
+		fmt.Printf("   Successfully reached worker gRPC port at %s:50053 directly!\n", workerIP)
 	}
 
 	// 4. Suspend Actor
