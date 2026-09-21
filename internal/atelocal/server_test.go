@@ -15,16 +15,25 @@
 package atelocal
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/ax/internal/controller"
+	"github.com/google/ax/internal/guest"
+	"github.com/google/ax/internal/substrate"
+	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -259,6 +268,202 @@ func TestCleanIPv4(t *testing.T) {
 	}
 }
 
+func TestControlServer_TemplateDeduplicationAndEgressPolicy(t *testing.T) {
+	runner := &mockRunner{created: make(map[string]bool)}
+	cfg := DefaultConfig()
+	cfg.Runner = runner
+
+	client, cleanup := startTestControlServer(t, cfg)
+	defer cleanup()
+
+	ctx := t.Context()
+
+	// 1. Create an ActorTemplate in atespace "ax"
+	_, err := client.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{
+		ActorTemplate: &ateapipb.ActorTemplate{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "ax",
+				Name:     "task-tmpl-1234",
+			},
+			Containers: []*ateapipb.Container{{
+				Name:  "guest",
+				Image: "debian:12",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateActorTemplate failed: %v", err)
+	}
+
+	// 2. List templates filtered by "ax" -> should return exactly 1 entry without duplicates
+	listResp, err := client.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{
+		Atespace: "ax",
+	})
+	if err != nil {
+		t.Fatalf("ListActorTemplates failed: %v", err)
+	}
+	if len(listResp.GetActorTemplates()) != 1 {
+		t.Fatalf("ListActorTemplates(ax) returned %d templates, want 1: %v", len(listResp.GetActorTemplates()), listResp.GetActorTemplates())
+	}
+	if got := listResp.GetActorTemplates()[0].GetMetadata().GetName(); got != "task-tmpl-1234" {
+		t.Errorf("template name = %q, want %q", got, "task-tmpl-1234")
+	}
+
+	// 3. Create, Get, Update, Delete EgressPolicy
+	actorRef := &ateapipb.ObjectRef{Atespace: "ax", Name: "policy-actor"}
+	policy := &ateapipb.EgressPolicy{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "ax", Name: "default"},
+	}
+	if _, err := client.CreateActorEgressPolicy(ctx, &ateapipb.CreateActorEgressPolicyRequest{
+		Actor:        actorRef,
+		EgressPolicy: policy,
+	}); err != nil {
+		t.Fatalf("CreateActorEgressPolicy failed: %v", err)
+	}
+
+	// Duplicate create should return AlreadyExists
+	if _, err := client.CreateActorEgressPolicy(ctx, &ateapipb.CreateActorEgressPolicyRequest{
+		Actor:        actorRef,
+		EgressPolicy: policy,
+	}); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("duplicate CreateActorEgressPolicy code = %v, want AlreadyExists", status.Code(err))
+	}
+
+	if _, err := client.GetActorEgressPolicy(ctx, &ateapipb.GetActorEgressPolicyRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("GetActorEgressPolicy failed: %v", err)
+	}
+	if _, err := client.UpdateActorEgressPolicy(ctx, &ateapipb.UpdateActorEgressPolicyRequest{
+		Actor:        actorRef,
+		EgressPolicy: policy,
+	}); err != nil {
+		t.Fatalf("UpdateActorEgressPolicy failed: %v", err)
+	}
+	if _, err := client.DeleteActorEgressPolicy(ctx, &ateapipb.DeleteActorEgressPolicyRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("DeleteActorEgressPolicy failed: %v", err)
+	}
+}
+
+func TestControlServer_ReconcilerIntegration(t *testing.T) {
+	// Start a mock readyz HTTP server representing the task container's metadata server
+	readyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	}))
+	defer readyServer.Close()
+
+	readyAddr := strings.TrimPrefix(readyServer.URL, "http://")
+
+	runner := &mockRunner{
+		created: make(map[string]bool),
+		inspectMap: map[string]*ContainerInspectResult{
+			"ate-default-e2e-task": {
+				ID: "ate-default-e2e-task",
+				Status: struct {
+					State    string `json:"state"`
+					Networks []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					} `json:"networks"`
+				}{
+					State: "running",
+					Networks: []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					}{
+						{Hostname: "ate-default-e2e-task", IPv4Address: readyAddr + "/32"},
+					},
+				},
+			},
+		},
+	}
+
+	cfg := DefaultConfig()
+	cfg.Runner = runner
+	cfg.ReadyTimeout = 500 * time.Millisecond
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer lis.Close()
+
+	grpcServer := grpc.NewServer()
+	srv.Register(grpcServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
+		Target:    lis.Addr().String(),
+		Plaintext: true,
+	})
+	if err != nil {
+		t.Fatalf("substrate.NewClientWithOptions failed: %v", err)
+	}
+	defer subClient.Close()
+
+	reconciler := controller.NewTaskReconciler(subClient, "default", "default")
+	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
+		return "test-gemini-key", nil
+	}
+	reconciler.WorkspaceReadyTimeout = 2 * time.Second
+
+	ctx := t.Context()
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "e2e-task",
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.TaskSpec{
+			Image:   "debian:12",
+			Command: []string{"sleep", "infinity"},
+		},
+		Status: &v1alpha1.TaskStatus{
+			Phase: "Running",
+		},
+	}
+
+	// 1. Reconcile active task -> should transition to Running and Ready=True, WorkspaceReady=True
+	reconciled, err := reconciler.Reconcile(ctx, task)
+	if err != nil {
+		t.Fatalf("Reconcile(active) failed: %v", err)
+	}
+	if reconciled.GetStatus().GetPhase() != "Running" {
+		t.Errorf("Phase = %q, want Running", reconciled.GetStatus().GetPhase())
+	}
+	for _, wantCond := range []string{"WorkspaceReady", "Ready"} {
+		foundTrue := false
+		for _, c := range reconciled.GetStatus().GetConditions() {
+			if c.GetType() == wantCond && c.GetStatus() == "True" {
+				foundTrue = true
+			}
+		}
+		if !foundTrue {
+			t.Errorf("expected condition %q=True on reconciled task, got conditions: %v", wantCond, reconciled.GetStatus().GetConditions())
+		}
+	}
+
+	// 2. Reconcile suspend -> should transition to Suspended
+	reconciled.Status.Phase = "Suspended"
+	suspended, err := reconciler.Reconcile(ctx, reconciled)
+	if err != nil {
+		t.Fatalf("Reconcile(suspend) failed: %v", err)
+	}
+	if suspended.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("Phase after suspend = %q, want Suspended", suspended.GetStatus().GetPhase())
+	}
+
+	// 3. ReconcileDelete -> should delete both actor and per-task ActorTemplate
+	if err := reconciler.ReconcileDelete(ctx, "default", "e2e-task"); err != nil {
+		t.Fatalf("ReconcileDelete failed: %v", err)
+	}
+}
+
 // Live test against real Apple container CLI
 func TestControlServer_LiveAppleContainer(t *testing.T) {
 	if _, err := exec.LookPath("container"); err != nil {
@@ -338,6 +543,136 @@ func TestControlServer_LiveAppleContainer(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("DeleteActor(%q) failed: %v", testActorName, err)
+	}
+}
+
+// Live end-to-end test: TaskReconciler + ate-local + Apple Container + ax-task-runner + guest.Client (ax ssh)
+func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
+	if _, err := exec.LookPath("container"); err != nil {
+		t.Skip("container CLI not available, skipping live reconciler test")
+	}
+
+	ctx := t.Context()
+	checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer checkCancel()
+	if err := exec.CommandContext(checkCtx, "container", "list").Run(); err != nil {
+		t.Skipf("container daemon not responsive: %v, skipping live reconciler test", err)
+	}
+
+	// Cross-compile ax-task-runner for linux/arm64 into temp dir
+	tmpDir := t.TempDir()
+	runnerBin := filepath.Join(tmpDir, "ax-task-runner")
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags=-s -w", "-o", runnerBin, "../../cmd/ax-task-runner")
+	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to cross-compile ax-task-runner: %v (%s)", err, string(out))
+	}
+
+	cfg := DefaultConfig()
+	cfg.ReadyTimeout = 5 * time.Second
+	cfg.Templates["default"] = TemplateConfig{
+		Atespace: "default",
+		Name:     "default",
+		Image:    "debian:12",
+		Port:     80,
+		Volumes:  []string{fmt.Sprintf("%s:/usr/local/bin/ax-task-runner", runnerBin)},
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer lis.Close()
+
+	grpcServer := grpc.NewServer()
+	srv.Register(grpcServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer func() {
+		grpcServer.Stop()
+		_ = srv.Close(context.Background())
+	}()
+
+	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
+		Target:    lis.Addr().String(),
+		Plaintext: true,
+	})
+	if err != nil {
+		t.Fatalf("substrate.NewClientWithOptions failed: %v", err)
+	}
+	defer subClient.Close()
+
+	reconciler := controller.NewTaskReconciler(subClient, "default", "default")
+	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
+		return "live-test-key", nil
+	}
+	reconciler.WorkspaceReadyTimeout = 10 * time.Second
+
+	taskName := fmt.Sprintf("live-task-%d", time.Now().UnixNano()%100000)
+	defer func() {
+		_ = reconciler.ReconcileDelete(context.Background(), "default", taskName)
+	}()
+
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     taskName,
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.TaskSpec{
+			Image:   "debian:12",
+			Command: []string{"sleep", "infinity"},
+			Debug:   true, // enables guest ProcessService (ax ssh)
+		},
+		Status: &v1alpha1.TaskStatus{
+			Phase: "Running",
+		},
+	}
+
+	reconciled, err := reconciler.Reconcile(ctx, task)
+	if err != nil {
+		t.Fatalf("Reconcile(%q) failed: %v", taskName, err)
+	}
+
+	workerIP := reconciled.GetStatus().GetWorkerIp()
+	t.Logf("Live Task reconciled: name=%s, workerIP=%s, phase=%s", taskName, workerIP, reconciled.GetStatus().GetPhase())
+
+	if reconciled.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("Phase = %q, want Running", reconciled.GetStatus().GetPhase())
+	}
+	for _, wantCond := range []string{"WorkspaceReady", "Ready"} {
+		foundTrue := false
+		for _, c := range reconciled.GetStatus().GetConditions() {
+			if c.GetType() == wantCond && c.GetStatus() == "True" {
+				foundTrue = true
+			}
+		}
+		if !foundTrue {
+			t.Errorf("expected condition %q=True on live task, got: %v", wantCond, reconciled.GetStatus().GetConditions())
+		}
+	}
+
+	// Dial guest daemon (ax ssh) inside the live Apple container over vmnet IP:80
+	guestClient, err := guest.Dial(fmt.Sprintf("%s:80", workerIP))
+	if err != nil {
+		t.Fatalf("guest.Dial(%s:80) failed: %v", workerIP, err)
+	}
+	defer guestClient.Close()
+
+	var stdout, stderr bytes.Buffer
+	exitCode, err := guestClient.Exec(ctx, guest.ExecOptions{
+		Command: []string{"uname", "-sm"},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+	})
+	if err != nil || exitCode != 0 {
+		t.Fatalf("guestClient.Exec(uname -sm) exit=%d err=%v stderr=%s", exitCode, err, stderr.String())
+	}
+	t.Logf("Live ax ssh guest exec inside Apple container (%s:80) output: %s", workerIP, strings.TrimSpace(stdout.String()))
+	if !strings.Contains(stdout.String(), "Linux") {
+		t.Errorf("unexpected uname output from container: %q", stdout.String())
 	}
 }
 

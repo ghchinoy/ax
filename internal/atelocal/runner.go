@@ -71,10 +71,54 @@ func NewDefaultContainerRunner(binPath string) ContainerRunner {
 }
 
 type defaultContainerRunner struct {
-	binaryPath string
+	binaryPath       string
+	detectedInitOnce bool
+	detectedInit     string
 }
 
 func (r *defaultContainerRunner) Run(ctx context.Context, args ...string) (string, error) {
+	out, err := r.execCmd(ctx, args...)
+	if err != nil && len(args) > 0 && args[0] == "run" && !containsArg(args, "--init-image") &&
+		strings.Contains(err.Error(), "image snapshot for ghcr.io/apple/containerization/vminit") {
+		if initImg := r.detectLocalVminitImage(ctx); initImg != "" {
+			retryArgs := make([]string, 0, len(args)+2)
+			retryArgs = append(retryArgs, "run", "--init-image", initImg)
+			retryArgs = append(retryArgs, args[1:]...)
+			return r.execCmd(ctx, retryArgs...)
+		}
+	}
+	return out, err
+}
+
+func containsArg(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag || strings.HasPrefix(a, flag+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *defaultContainerRunner) detectLocalVminitImage(ctx context.Context) string {
+	if r.detectedInitOnce {
+		return r.detectedInit
+	}
+	r.detectedInitOnce = true
+	out, err := r.execCmd(ctx, "image", "list")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "ghcr.io/apple/containerization/vminit" && fields[1] != "TAG" {
+			r.detectedInit = fmt.Sprintf("%s:%s", fields[0], fields[1])
+			return r.detectedInit
+		}
+	}
+	return ""
+}
+
+func (r *defaultContainerRunner) execCmd(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, r.binaryPath, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
