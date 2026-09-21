@@ -17,9 +17,9 @@ SHELL := /bin/bash
 # Configuration
 AX_IMAGE_REPO ?= gcr.io/ax-substrate/ate-images
 TASK_RUNNER_REPO ?= $(AX_IMAGE_REPO)/ax-task-runner
-CONTAINER_CLI ?= $(shell which podman 2>/dev/null || which docker 2>/dev/null)
+CONTAINER_CLI ?= $(shell which container 2>/dev/null || which podman 2>/dev/null || which docker 2>/dev/null)
 
-.PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-server deploy-redis apply-example test clean
+.PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-server deploy-redis apply-example test clean build-ate-local run-ate-local
 
 all: build
 
@@ -27,14 +27,24 @@ all: build
 ## Build Targets
 ## --------------------------------------
 
-# Build all local binaries (ax CLI, server)
+# Build all local binaries (ax CLI, server, ate-local)
 build: build-binaries
 
 build-binaries:
-	@echo "==> Building local binaries (ax, ax-server)..."
+	@echo "==> Building local binaries (ax, ax-server, ate-local)..."
 	@mkdir -p bin
 	go build -trimpath -ldflags="-s -w" -o bin/ax ./cmd/ax
 	go build -trimpath -ldflags="-s -w" -o bin/ax-server ./cmd/ax-server
+	go build -trimpath -ldflags="-s -w" -o bin/ate-local ./cmd/ate-local
+
+build-ate-local:
+	@echo "==> Building ate-local..."
+	@mkdir -p bin
+	go build -trimpath -ldflags="-s -w" -o bin/ate-local ./cmd/ate-local
+
+run-ate-local: build-ate-local
+	@echo "==> Running ate-local daemon..."
+	./bin/ate-local --config examples/ate_local/ate-local.yaml
 
 # Install the ax CLI into $(go env GOPATH)/bin
 install:
