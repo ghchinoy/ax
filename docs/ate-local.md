@@ -30,19 +30,16 @@ Agent Substrate is designed for high-density, multi-tenant agent execution on Ku
 
 ## API RPCs Implemented
 
-- `CreateAtespace(CreateAtespaceRequest)`: Registers namespace for actors.
-- `GetAtespace(GetAtespaceRequest)`: Checks namespace existence.
-- `ListAtespaces(ListAtespacesRequest)`: Lists namespaces.
-- `DeleteAtespace(DeleteAtespaceRequest)`: Deletes namespace if empty.
-- `CreateActor(CreateActorRequest)`: Registers actor with template binding.
-- `ResumeActor(ResumeActorRequest)`: Starts Apple container, inspects network, returns `AteomPodIp`.
-- `SuspendActor(SuspendActorRequest)`: Stops container, sets status to `STATUS_SUSPENDED`.
-- `PauseActor(PauseActorRequest)`: Pauses container.
-- `DeleteActor(DeleteActorRequest)`: Forces deletion of container.
-- `GetActor(GetActorRequest)`: Returns actor state.
-- `ListActors(ListActorsRequest)`: Returns all actors in atespace.
-- `ListWorkers(ListWorkersRequest)`: Lists running containers as active workers.
-- `DebugClear(DebugClearRequest)`: Stops and deletes all managed containers.
+- `CreateAtespace` / `GetAtespace` / `ListAtespaces` / `DeleteAtespace`: Manages namespaces for actors.
+- `CreateActorTemplate` / `GetActorTemplate` / `ListActorTemplates` / `DeleteActorTemplate`: Manages container templates (`image`, `command`, `env`, `readyz` port).
+- `CreateActor`: Registers an actor bound to an `ActorTemplate`.
+- `ResumeActor`: Starts/runs the Apple container (`container run -d ...`), inspects the `vmnet` interface, and returns the container IP in `Status.WorkerAssignment.WorkerPodIp`.
+- `SuspendActor`: Stops the container (`container stop --time 2`), sets state to `ACTOR_STATE_SUSPENDED`.
+- `PauseActor`: Stops the container, sets state to `ACTOR_STATE_PAUSED`.
+- `DeleteActor`: Forces deletion of the container (`container delete --force`).
+- `GetActor` / `ListActors`: Returns actor metadata, state, and worker IP assignment.
+- `CreateActorEgressPolicy` / `GetActorEgressPolicy` / `UpdateActorEgressPolicy` / `DeleteActorEgressPolicy`: Records per-actor egress allowlists for `TaskReconciler`.
+- `ListWorkers`: Lists running Apple containers as active workers.
 
 ---
 
@@ -55,13 +52,15 @@ go build -o bin/ate-local ./cmd/ate-local
 ./bin/ate-local --config examples/ate_local/ate-local.yaml
 ```
 
-### 2. Configure `ax` to use local Substrate
+### 2. Configure `ax-controller` to use local Substrate
 
-Point AX's Substrate/ATE endpoint to `localhost:50051`:
+Point `ax-controller` at `localhost:50051` with plaintext gRPC:
 
-```yaml
-ate:
-  endpoint: "localhost:50051"
+```bash
+./bin/ax-controller \
+  --substrate-endpoint localhost:50051 \
+  --substrate-plaintext \
+  --redis-addr localhost:6379
 ```
 
 ---

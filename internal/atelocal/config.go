@@ -24,20 +24,24 @@ import (
 
 // TemplateConfig defines container parameters for an ActorTemplate.
 type TemplateConfig struct {
-	Image   string            `yaml:"image"`
-	Port    int               `yaml:"port,omitempty"` // HarnessService port in container (default 50053)
-	Command []string          `yaml:"command,omitempty"`
-	WorkDir string            `yaml:"work_dir,omitempty"`
-	Env     map[string]string `yaml:"env,omitempty"`
-	Volumes []string          `yaml:"volumes,omitempty"`
-	CPUs    int               `yaml:"cpus,omitempty"`
-	Memory  string            `yaml:"memory,omitempty"`
+	Atespace  string            `yaml:"atespace,omitempty"`
+	Name      string            `yaml:"name,omitempty"`
+	Image     string            `yaml:"image"`
+	InitImage string            `yaml:"init_image,omitempty"`
+	Port      int               `yaml:"port,omitempty"` // Guest/readyz or HarnessService port in container (default 80)
+	Command   []string          `yaml:"command,omitempty"`
+	WorkDir   string            `yaml:"work_dir,omitempty"`
+	Env       map[string]string `yaml:"env,omitempty"`
+	Volumes   []string          `yaml:"volumes,omitempty"`
+	CPUs      int               `yaml:"cpus,omitempty"`
+	Memory    string            `yaml:"memory,omitempty"`
 }
 
 // Config configures the local Substrate Control server.
 type Config struct {
 	Address         string                    `yaml:"address"` // gRPC listen address (default ":50051")
 	DefaultTemplate string                    `yaml:"default_template,omitempty"`
+	InitImage       string                    `yaml:"init_image,omitempty"` // Optional custom Apple container vminit image
 	Templates       map[string]TemplateConfig `yaml:"templates,omitempty"`
 	ReadyTimeout    time.Duration             `yaml:"ready_timeout,omitempty"`
 	BinaryPath      string                    `yaml:"binary_path,omitempty"`
@@ -83,6 +87,9 @@ func (c *Config) setDefaults() {
 	if c.ReadyTimeout == 0 {
 		c.ReadyTimeout = 20 * time.Second
 	}
+	if c.InitImage == "" {
+		c.InitImage = os.Getenv("ATE_LOCAL_INIT_IMAGE")
+	}
 	if c.Templates == nil {
 		c.Templates = make(map[string]TemplateConfig)
 	}
@@ -90,8 +97,10 @@ func (c *Config) setDefaults() {
 	// Default template if none provided
 	if _, ok := c.Templates["default"]; !ok {
 		c.Templates["default"] = TemplateConfig{
-			Image: "debian:12",
-			Port:  50053,
+			Atespace: "default",
+			Name:     "default",
+			Image:    "debian:12",
+			Port:     80,
 		}
 	}
 }

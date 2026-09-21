@@ -16,9 +16,11 @@ package atelocal
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -77,10 +79,11 @@ type Server struct {
 	cfg    *Config
 	runner ContainerRunner
 
-	mu        sync.RWMutex
-	atespaces map[string]bool
-	templates map[string]TemplateConfig // key: atespace/name or name
-	actors    map[string]*ActorRecord   // key: atespace/name
+	mu             sync.RWMutex
+	atespaces      map[string]bool
+	templates      map[string]TemplateConfig          // key: atespace/name
+	actors         map[string]*ActorRecord            // key: atespace/name
+	egressPolicies map[string]*ateapipb.EgressPolicy  // key: atespace/actorName
 }
 
 // NewServer creates a new local Substrate Control server instance.
@@ -95,15 +98,29 @@ func NewServer(cfg *Config) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:       cfg,
-		runner:    runner,
-		atespaces: make(map[string]bool),
-		templates: make(map[string]TemplateConfig),
-		actors:    make(map[string]*ActorRecord),
+		cfg:            cfg,
+		runner:         runner,
+		atespaces:      make(map[string]bool),
+		templates:      make(map[string]TemplateConfig),
+		actors:         make(map[string]*ActorRecord),
+		egressPolicies: make(map[string]*ateapipb.EgressPolicy),
 	}
 
 	for k, v := range cfg.Templates {
-		s.templates[k] = v
+		atespace := v.Atespace
+		name := v.Name
+		if parts := strings.SplitN(k, "/", 2); len(parts) == 2 {
+			atespace = parts[0]
+			name = parts[1]
+		} else if name == "" {
+			name = k
+		}
+		if atespace == "" {
+			atespace = "default"
+		}
+		v.Atespace = atespace
+		v.Name = name
+		s.templates[resourceKey(atespace, name)] = v
 	}
 
 	// Default atespaces
@@ -125,6 +142,16 @@ var nonAlphanumeric = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
 func sanitizeName(name string) string {
 	s := nonAlphanumeric.ReplaceAllString(name, "-")
 	return strings.Trim(s, "-._")
+}
+
+func resolveVolumeSpec(vol string) string {
+	parts := strings.SplitN(vol, ":", 2)
+	if len(parts) == 2 && (strings.HasPrefix(parts[0], "./") || strings.HasPrefix(parts[0], "../")) {
+		if abs, err := filepath.Abs(parts[0]); err == nil {
+			return fmt.Sprintf("%s:%s", abs, parts[1])
+		}
+	}
+	return vol
 }
 
 // CreateAtespace creates or registers a new Atespace isolation boundary.
@@ -222,7 +249,16 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 
 	key := resourceKey(atespace, name)
 
-	var tc TemplateConfig
+	defaultTC := s.resolveTemplate("default", "default")
+	tc := TemplateConfig{
+		Atespace:  atespace,
+		Name:      name,
+		InitImage: defaultTC.InitImage,
+		Port:      80, // Default HTTP/readyz port in AX task runner
+		Volumes:   append([]string(nil), defaultTC.Volumes...),
+		CPUs:      defaultTC.CPUs,
+		Memory:    defaultTC.Memory,
+	}
 	if len(tmpl.GetContainers()) > 0 {
 		c := tmpl.GetContainers()[0]
 		tc.Image = c.GetImage()
@@ -233,15 +269,16 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 				tc.Env[env.GetName()] = env.GetValue()
 			}
 		}
+		if c.GetReadyz() != nil && c.GetReadyz().GetHttpGet() != nil && c.GetReadyz().GetHttpGet().GetPort() > 0 {
+			tc.Port = int(c.GetReadyz().GetHttpGet().GetPort())
+		}
 	}
 	if tc.Image == "" {
 		tc.Image = "debian:12"
 	}
-	tc.Port = 80 // Default HTTP/readyz port in AX task runner
 
 	s.mu.Lock()
 	s.templates[key] = tc
-	s.templates[name] = tc
 	s.mu.Unlock()
 
 	return tmpl, nil
@@ -257,14 +294,7 @@ func (s *Server) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTem
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	key := resourceKey(ref.GetAtespace(), ref.GetName())
-	tc, ok := s.templates[key]
-	if !ok {
-		tc, ok = s.templates[ref.GetName()]
-	}
-	if !ok {
-		tc, ok = s.cfg.Templates[ref.GetName()]
-	}
+	tc, ok := s.lookupTemplateLocked(ref.GetAtespace(), ref.GetName())
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "template %q not found", ref.GetName())
 	}
@@ -282,16 +312,21 @@ func (s *Server) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTem
 	}, nil
 }
 
-// ListActorTemplates returns all known ActorTemplates.
+// ListActorTemplates returns all known ActorTemplates, optionally filtered by atespace.
 func (s *Server) ListActorTemplates(ctx context.Context, req *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	filterAtespace := req.GetAtespace()
 	var list []*ateapipb.ActorTemplate
-	for name, tc := range s.templates {
+	for _, tc := range s.templates {
+		if filterAtespace != "" && tc.Atespace != filterAtespace {
+			continue
+		}
 		list = append(list, &ateapipb.ActorTemplate{
 			Metadata: &ateapipb.ResourceMetadata{
-				Name: name,
+				Atespace: tc.Atespace,
+				Name:     tc.Name,
 			},
 			Containers: []*ateapipb.Container{{
 				Name:    "guest",
@@ -317,7 +352,6 @@ func (s *Server) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteAc
 
 	key := resourceKey(ref.GetAtespace(), ref.GetName())
 	delete(s.templates, key)
-	delete(s.templates, ref.GetName())
 
 	return &ateapipb.ActorTemplate{
 		Metadata: &ateapipb.ResourceMetadata{
@@ -360,15 +394,16 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 		templateName = "default"
 	}
 
-	tc := s.resolveTemplate(atespace, templateName)
+	tc := s.resolveTemplateLocked(atespace, templateName)
 	port := tc.Port
 	if port == 0 {
-		port = 50053
+		port = 80
 	}
 
 	containerName := fmt.Sprintf("ate-%s-%s", sanitizeName(atespace), sanitizeName(name))
 	if len(containerName) > 48 {
-		containerName = containerName[:48]
+		sum := sha256.Sum256([]byte(containerName))
+		containerName = fmt.Sprintf("%s-%x", strings.TrimRight(containerName[:41], "-._"), sum[:3])
 	}
 
 	record := &ActorRecord{
@@ -387,20 +422,33 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	return record.toProto(), nil
 }
 
-func (s *Server) resolveTemplate(atespace, name string) TemplateConfig {
+func (s *Server) lookupTemplateLocked(atespace, name string) (TemplateConfig, bool) {
 	if tc, ok := s.templates[resourceKey(atespace, name)]; ok {
-		return tc
+		return tc, true
 	}
-	if tc, ok := s.templates[name]; ok {
-		return tc
+	if tc, ok := s.templates[resourceKey("default", name)]; ok {
+		return tc, true
 	}
 	if tc, ok := s.cfg.Templates[name]; ok {
+		return tc, true
+	}
+	return TemplateConfig{}, false
+}
+
+func (s *Server) resolveTemplate(atespace, name string) TemplateConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.resolveTemplateLocked(atespace, name)
+}
+
+func (s *Server) resolveTemplateLocked(atespace, name string) TemplateConfig {
+	if tc, ok := s.lookupTemplateLocked(atespace, name); ok {
 		return tc
 	}
-	if tc, ok := s.cfg.Templates["default"]; ok {
+	if tc, ok := s.lookupTemplateLocked("default", "default"); ok {
 		return tc
 	}
-	return TemplateConfig{Image: "debian:12", Port: 50053}
+	return TemplateConfig{Atespace: "default", Name: "default", Image: "debian:12", Port: 80}
 }
 
 // ResumeActor provisions and starts an Apple container for the Actor, returning its routable IP.
@@ -437,11 +485,18 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 	} else {
 		// Run fresh container
 		runArgs := []string{"run", "--progress", "none", "-d", "--name", actor.ContainerName}
+		initImg := tmpl.InitImage
+		if initImg == "" {
+			initImg = s.cfg.InitImage
+		}
+		if initImg != "" {
+			runArgs = append(runArgs, "--init-image", initImg)
+		}
 		for k, v := range tmpl.Env {
 			runArgs = append(runArgs, "-e", fmt.Sprintf("%s=%s", k, v))
 		}
 		for _, vol := range tmpl.Volumes {
-			runArgs = append(runArgs, "-v", vol)
+			runArgs = append(runArgs, "-v", resolveVolumeSpec(vol))
 		}
 		if tmpl.WorkDir != "" {
 			runArgs = append(runArgs, "-w", tmpl.WorkDir)
@@ -477,9 +532,15 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 		ip = "127.0.0.1"
 	}
 
-	targetAddr := fmt.Sprintf("%s:%d", ip, actor.Port)
-	if err := s.waitForPort(ctx, targetAddr, s.cfg.ReadyTimeout); err != nil {
-		slog.Warn("port not immediately reachable", "address", targetAddr, "error", err)
+	isNonServerCommand := len(tmpl.Command) > 0 && tmpl.Command[0] == "sleep"
+	if actor.Port > 0 && !isNonServerCommand {
+		targetAddr := fmt.Sprintf("%s:%d", ip, actor.Port)
+		if _, _, err := net.SplitHostPort(ip); err == nil {
+			targetAddr = ip
+		}
+		if err := s.waitForPort(ctx, targetAddr, s.cfg.ReadyTimeout); err != nil {
+			slog.Warn("port not immediately reachable", "address", targetAddr, "error", err)
+		}
 	}
 
 	s.mu.Lock()
@@ -614,6 +675,7 @@ func (s *Server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorReque
 	actor, ok := s.actors[key]
 	if ok {
 		delete(s.actors, key)
+		delete(s.egressPolicies, key)
 	}
 	s.mu.Unlock()
 
@@ -624,6 +686,88 @@ func (s *Server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorReque
 	_, _ = s.runner.Run(ctx, "delete", "--force", actor.ContainerName)
 
 	return actor.toProto(), nil
+}
+
+// CreateActorEgressPolicy records an egress policy for the specified Actor.
+func (s *Server) CreateActorEgressPolicy(ctx context.Context, req *ateapipb.CreateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	ref := req.GetActor()
+	if ref == nil || ref.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "actor ref is required")
+	}
+	policy := req.GetEgressPolicy()
+	if policy == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "egress_policy is required")
+	}
+
+	key := resourceKey(ref.GetAtespace(), ref.GetName())
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.egressPolicies[key]; exists {
+		return nil, status.Errorf(codes.AlreadyExists, "egress policy for actor %q already exists", key)
+	}
+	s.egressPolicies[key] = policy
+	return policy, nil
+}
+
+// GetActorEgressPolicy retrieves the egress policy for the specified Actor.
+func (s *Server) GetActorEgressPolicy(ctx context.Context, req *ateapipb.GetActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	ref := req.GetActor()
+	if ref == nil || ref.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "actor ref is required")
+	}
+
+	key := resourceKey(ref.GetAtespace(), ref.GetName())
+
+	s.mu.RLock()
+	policy, ok := s.egressPolicies[key]
+	s.mu.RUnlock()
+
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "egress policy for actor %q not found", key)
+	}
+	return policy, nil
+}
+
+// UpdateActorEgressPolicy updates the egress policy for the specified Actor.
+func (s *Server) UpdateActorEgressPolicy(ctx context.Context, req *ateapipb.UpdateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	ref := req.GetActor()
+	if ref == nil || ref.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "actor ref is required")
+	}
+	policy := req.GetEgressPolicy()
+	if policy == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "egress_policy is required")
+	}
+
+	key := resourceKey(ref.GetAtespace(), ref.GetName())
+
+	s.mu.Lock()
+	s.egressPolicies[key] = policy
+	s.mu.Unlock()
+
+	return policy, nil
+}
+
+// DeleteActorEgressPolicy deletes the egress policy for the specified Actor.
+func (s *Server) DeleteActorEgressPolicy(ctx context.Context, req *ateapipb.DeleteActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	ref := req.GetActor()
+	if ref == nil || ref.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "actor ref is required")
+	}
+
+	key := resourceKey(ref.GetAtespace(), ref.GetName())
+
+	s.mu.Lock()
+	policy, ok := s.egressPolicies[key]
+	delete(s.egressPolicies, key)
+	s.mu.Unlock()
+
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "egress policy for actor %q not found", key)
+	}
+	return policy, nil
 }
 
 // ListWorkers returns active running containers hosting actors.
