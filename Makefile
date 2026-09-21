@@ -31,11 +31,21 @@ all: build
 build: build-binaries
 
 build-binaries:
-	@echo "==> Building local binaries (ax, ax-controller, ax-server)..."
+	@echo "==> Building local binaries (ax, ax-controller, ax-server, ate-local)..."
 	@mkdir -p bin
 	go build -trimpath -ldflags="-s -w" -o bin/ax ./cmd/ax
 	go build -trimpath -ldflags="-s -w" -o bin/ax-controller ./cmd/ax-controller
 	go build -trimpath -ldflags="-s -w" -o bin/ax-server ./cmd/ax-server
+	go build -trimpath -ldflags="-s -w" -o bin/ate-local ./cmd/ate-local
+
+build-ate-local:
+	@echo "==> Building ate-local..."
+	@mkdir -p bin
+	go build -trimpath -ldflags="-s -w" -o bin/ate-local ./cmd/ate-local
+
+run-ate-local: build-ate-local
+	@echo "==> Running ate-local daemon..."
+	./bin/ate-local --config examples/ate_local/ate-local.yaml
 
 # Install the ax CLI into $(go env GOPATH)/bin
 install:
