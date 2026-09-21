@@ -17,7 +17,7 @@ SHELL := /bin/bash
 # Configuration
 AX_IMAGE_REPO ?= gcr.io/ax-substrate/ate-images
 TASK_RUNNER_REPO ?= $(AX_IMAGE_REPO)/ax-task-runner
-CONTAINER_CLI ?= $(shell which podman 2>/dev/null || which docker 2>/dev/null)
+CONTAINER_CLI ?= $(shell which container 2>/dev/null || which podman 2>/dev/null || which docker 2>/dev/null)
 
 .PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-controller deploy-server deploy-redis apply-example test clean
 

@@ -39,6 +39,7 @@ func main() {
 	configFile := flag.String("config", "", "Path to ate-local.yaml configuration file (optional)")
 	addr := flag.String("addr", ":50051", "gRPC server listen address")
 	containerBin := flag.String("container-bin", "", "Path to Apple container CLI binary (optional)")
+	initImage := flag.String("init-image", "", "Custom Apple container vminit image (optional, auto-detected on version mismatch)")
 	flag.Parse()
 
 	cfg, err := atelocal.LoadConfig(*configFile)
@@ -52,6 +53,9 @@ func main() {
 	}
 	if *containerBin != "" {
 		cfg.BinaryPath = *containerBin
+	}
+	if *initImage != "" {
+		cfg.InitImage = *initImage
 	}
 
 	server, err := atelocal.NewServer(cfg)
