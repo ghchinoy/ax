@@ -9,3 +9,6 @@ bin/
 /ax-controller
 
 cmd/ax-task-runner/__pycache__/antigravity_bootstrap.cpython-313.pyc
+
+# Local AX stack state (examples/ate_local/local-stack.sh)
+.ax-local/

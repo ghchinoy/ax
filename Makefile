@@ -19,7 +19,7 @@ AX_IMAGE_REPO ?= gcr.io/ax-substrate/ate-images
 TASK_RUNNER_REPO ?= $(AX_IMAGE_REPO)/ax-task-runner
 CONTAINER_CLI ?= $(shell which container 2>/dev/null || which podman 2>/dev/null || which docker 2>/dev/null)
 
-.PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-controller deploy-server deploy-redis apply-example test clean
+.PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-controller deploy-server deploy-redis apply-example test clean build-ate-local run-ate-local local-up local-down local-status local-logs local-reset
 
 all: build
 
@@ -46,6 +46,23 @@ build-ate-local:
 run-ate-local: build-ate-local
 	@echo "==> Running ate-local daemon..."
 	./bin/ate-local --config examples/ate_local/ate-local.yaml
+
+# Full local AX stack on macOS (Valkey, ate-local, ax-controller, ax-server)
+# backed by Apple container. See docs/ate-local.md.
+local-up:
+	./examples/ate_local/local-stack.sh up
+
+local-down:
+	./examples/ate_local/local-stack.sh down
+
+local-status:
+	./examples/ate_local/local-stack.sh status
+
+local-logs:
+	./examples/ate_local/local-stack.sh logs
+
+local-reset:
+	./examples/ate_local/local-stack.sh reset
 
 # Install the ax CLI into $(go env GOPATH)/bin
 install:

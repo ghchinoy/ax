@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# local-stack.sh runs the full AX stack on macOS without Kubernetes:
+#
+#   ax CLI -> ax-server -> Valkey -> ax-controller -> ate-local -> Apple container
+#
+# Components are started in dependency order, and each one must accept
+# connections before the next starts. This keeps ax-controller from starting
+# before ate-local and sitting in gRPC reconnect backoff.
+#
+# Usage: examples/ate_local/local-stack.sh {up|down|status|logs [component]|reset}
+#
+# Ports and names can be overridden with environment variables:
+#   AX_LOCAL_REDIS_PORT      (default 6379)
+#   AX_LOCAL_SUBSTRATE_PORT  (default 50051)
+#   AX_LOCAL_SERVER_PORT     (default 8090; 8080 is avoided because it is a common default)
+#   AX_LOCAL_VALKEY_NAME     (default ax-local-valkey)
+#   AX_LOCAL_VALKEY_IMAGE    (default valkey/valkey:8-alpine)
+#   AX_LOCAL_DIR             (default ./.ax-local)
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+REDIS_PORT="${AX_LOCAL_REDIS_PORT:-6379}"
+SUBSTRATE_PORT="${AX_LOCAL_SUBSTRATE_PORT:-50051}"
+SERVER_PORT="${AX_LOCAL_SERVER_PORT:-8090}"
+VALKEY_NAME="${AX_LOCAL_VALKEY_NAME:-ax-local-valkey}"
+VALKEY_IMAGE="${AX_LOCAL_VALKEY_IMAGE:-valkey/valkey:8-alpine}"
+STATE_DIR="${AX_LOCAL_DIR:-${REPO_ROOT}/.ax-local}"
+BIN_DIR="${STATE_DIR}/bin"
+PID_DIR="${STATE_DIR}/pids"
+LOG_DIR="${STATE_DIR}/logs"
+CONFIG_FILE="${STATE_DIR}/ate-local.yaml"
+ENV_FILE="${STATE_DIR}/env"
+HOST="127.0.0.1"
+WAIT_SECONDS=30
+
+# Processes this script manages, in start order.
+COMPONENTS=(ate-local ax-controller ax-server)
+
+info() { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '17,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+# port_owner prints "command (pid N)" for the process listening on a TCP port.
+port_owner() {
+  local pid
+  pid="$(lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -n1 || true)"
+  [[ -z "${pid}" ]] && return 1
+  printf '%s (pid %s)' "$(ps -p "${pid}" -o comm= 2>/dev/null | xargs basename 2>/dev/null)" "${pid}"
+}
+
+port_open() { nc -z "${HOST}" "$1" >/dev/null 2>&1; }
+
+wait_for_port() {
+  local name="$1" port="$2" log="${3:-}"
+  local deadline=$((SECONDS + WAIT_SECONDS))
+  while ! port_open "${port}"; do
+    if (( SECONDS >= deadline )); then
+      warn "${name} did not accept connections on ${HOST}:${port} within ${WAIT_SECONDS}s"
+      [[ -n "${log}" && -f "${log}" ]] && tail -n 20 "${log}" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+pid_of() {
+  local file="${PID_DIR}/$1.pid"
+  [[ -f "${file}" ]] && cat "${file}"
+}
+
+alive() {
+  local pid
+  pid="$(pid_of "$1")" || return 1
+  [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+valkey_running() {
+  container list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "${VALKEY_NAME}"
+}
+
+valkey_exists() {
+  container list --all 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "${VALKEY_NAME}"
+}
+
+check_prereqs() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "local-stack.sh requires macOS (Apple container)"
+  command -v container >/dev/null || die "Apple 'container' CLI not found in PATH"
+  command -v go >/dev/null || die "go not found in PATH"
+  command -v nc >/dev/null || die "nc not found in PATH"
+  container list >/dev/null 2>&1 || die "Apple container is not responding; try 'container system start'"
+}
+
+# check_port fails if a port is held by something this script did not start.
+check_port() {
+  local name="$1" port="$2" ours="$3"
+  local owner
+  if owner="$(port_owner "${port}")"; then
+    if [[ "${ours}" == "yes" ]]; then
+      return 0
+    fi
+    die "port ${port} (needed by ${name}) is in use by ${owner}. Stop it or set the matching AX_LOCAL_*_PORT variable."
+  fi
+}
+
+build() {
+  info "Building binaries into ${BIN_DIR}"
+  mkdir -p "${BIN_DIR}/linux_arm64"
+  go build -o "${BIN_DIR}/ate-local" ./cmd/ate-local
+  go build -o "${BIN_DIR}/ax-controller" ./cmd/ax-controller
+  go build -o "${BIN_DIR}/ax-server" ./cmd/ax-server
+  go build -o "${BIN_DIR}/ax" ./cmd/ax
+  # Apple container runs arm64 Linux guests; the published ax-task-runner image is amd64.
+  GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+    go build -trimpath -ldflags="-s -w" -o "${BIN_DIR}/linux_arm64/ax-task-runner" ./cmd/ax-task-runner
+}
+
+write_config() {
+  cat >"${CONFIG_FILE}" <<EOF
+# Generated by local-stack.sh; edits are overwritten by 'up'.
+address: "${HOST}:${SUBSTRATE_PORT}"
+ready_timeout: "20s"
+templates:
+  # ax-controller creates one ActorTemplate per Task. ate-local copies this
+  # template's volumes into each one, so every Task gets the arm64 runner.
+  default:
+    image: "debian:12"
+    port: 80
+    volumes:
+      - "${BIN_DIR}/linux_arm64/ax-task-runner:/usr/local/bin/ax-task-runner"
+    cpus: 2
+    memory: "1024M"
+EOF
+}
+
+write_env() {
+  cat >"${ENV_FILE}" <<EOF
+# source this file to point the ax CLI at the local stack
+export AX_SERVER=localhost:${SERVER_PORT}
+export PATH="${BIN_DIR}:\${PATH}"
+EOF
+}
+
+start_valkey() {
+  if valkey_running; then
+    info "Valkey already running (${VALKEY_NAME})"
+  else
+    check_port "Valkey" "${REDIS_PORT}" no
+    if valkey_exists; then
+      info "Starting existing Valkey container ${VALKEY_NAME}"
+      container start "${VALKEY_NAME}" >/dev/null
+    else
+      info "Starting Valkey (${VALKEY_IMAGE}) in Apple container"
+      container run -d --progress none --name "${VALKEY_NAME}" \
+        -p "${HOST}:${REDIS_PORT}:6379" --memory 256M "${VALKEY_IMAGE}" >/dev/null
+    fi
+  fi
+  wait_for_port "Valkey" "${REDIS_PORT}"
+}
+
+start_component() {
+  local name="$1" port="$2"
+  shift 2
+  local log="${LOG_DIR}/${name}.log"
+  if alive "${name}"; then
+    info "${name} already running (pid $(pid_of "${name}"))"
+    return 0
+  fi
+  check_port "${name}" "${port}" no
+  info "Starting ${name} on ${HOST}:${port}"
+  nohup "$@" >"${log}" 2>&1 &
+  echo $! >"${PID_DIR}/${name}.pid"
+  if ! wait_for_port "${name}" "${port}" "${log}"; then
+    stop_component "${name}"
+    die "${name} failed to start; see ${log}"
+  fi
+}
+
+stop_component() {
+  local name="$1" pid
+  pid="$(pid_of "${name}")" || { rm -f "${PID_DIR}/${name}.pid"; return 0; }
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+    info "Stopping ${name} (pid ${pid})"
+    kill -TERM "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.2
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      warn "${name} did not exit after SIGTERM; sending SIGKILL"
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
+  fi
+  rm -f "${PID_DIR}/${name}.pid"
+}
+
+cmd_up() {
+  check_prereqs
+  mkdir -p "${PID_DIR}" "${LOG_DIR}"
+
+  # Fail before building anything if a port is taken by something else.
+  valkey_running || check_port "Valkey" "${REDIS_PORT}" no
+  alive ate-local || check_port "ate-local" "${SUBSTRATE_PORT}" no
+  alive ax-server || check_port "ax-server" "${SERVER_PORT}" no
+
+  build
+  write_config
+  write_env
+
+  start_valkey
+  start_component ate-local "${SUBSTRATE_PORT}" \
+    "${BIN_DIR}/ate-local" --config "${CONFIG_FILE}"
+  # ax-controller has no listening port; it depends on Valkey and ate-local.
+  if alive ax-controller; then
+    info "ax-controller already running (pid $(pid_of ax-controller))"
+  else
+    info "Starting ax-controller"
+    nohup "${BIN_DIR}/ax-controller" \
+      --substrate-endpoint "${HOST}:${SUBSTRATE_PORT}" \
+      --substrate-plaintext \
+      --redis-addr "${HOST}:${REDIS_PORT}" \
+      >"${LOG_DIR}/ax-controller.log" 2>&1 &
+    echo $! >"${PID_DIR}/ax-controller.pid"
+    sleep 1
+    alive ax-controller || { tail -n 20 "${LOG_DIR}/ax-controller.log" >&2; die "ax-controller exited; see ${LOG_DIR}/ax-controller.log"; }
+  fi
+  start_component ax-server "${SERVER_PORT}" \
+    "${BIN_DIR}/ax-server" --addr "${HOST}:${SERVER_PORT}" --redis-addr "${HOST}:${REDIS_PORT}"
+
+  echo
+  cmd_status
+  cat <<EOF
+
+The local AX stack is up. Point the ax CLI at it:
+
+  source ${ENV_FILE#"${REPO_ROOT}/"}
+
+Then try:
+
+  ax apply -f examples/ate_local/task-local.yaml
+  ax resume local-task
+  ax describe task local-task
+  ax ssh local-task -- uname -sm
+  ax delete task local-task
+
+Logs: examples/ate_local/local-stack.sh logs [component]
+Stop: examples/ate_local/local-stack.sh down
+EOF
+  if owner="$(port_owner 8080)"; then
+    [[ "${SERVER_PORT}" != "8080" ]] && warn "port 8080 is used by ${owner}. Without AX_SERVER set, ax connects to 8080 by default."
+  fi
+}
+
+cmd_down() {
+  local keep_valkey=no
+  [[ "${1:-}" == "--keep-valkey" ]] && keep_valkey=yes
+  # Stop in reverse dependency order.
+  stop_component ax-server
+  stop_component ax-controller
+  stop_component ate-local
+  if [[ "${keep_valkey}" == "no" ]] && valkey_exists; then
+    info "Removing Valkey container ${VALKEY_NAME}"
+    container delete --force "${VALKEY_NAME}" >/dev/null 2>&1 || true
+  fi
+  # ate-local stops actor containers on shutdown; report any that remain.
+  local leftovers
+  leftovers="$(container list --all 2>/dev/null | awk 'NR>1 && $1 ~ /^ate-/ {print $1}' || true)"
+  if [[ -n "${leftovers}" ]]; then
+    warn "actor containers remain (remove with 'reset' or 'container delete --force'):"
+    printf '  %s\n' ${leftovers} >&2
+  fi
+}
+
+status_line() {
+  local name="$1" port="$2" state="stopped" pid="-"
+  if [[ "${name}" == "valkey" ]]; then
+    valkey_running && state="running" && pid="container"
+  elif alive "${name}"; then
+    state="running"
+    pid="$(pid_of "${name}")"
+  fi
+  local reach="-"
+  if [[ "${port}" != "-" ]]; then
+    port_open "${port}" && reach="yes" || reach="no"
+  fi
+  printf '%-14s %-10s %-10s %-8s %s\n' "${name}" "${state}" "${pid}" "${port}" "${reach}"
+}
+
+cmd_status() {
+  printf '%-14s %-10s %-10s %-8s %s\n' COMPONENT STATE PID PORT REACHABLE
+  status_line valkey "${REDIS_PORT}"
+  status_line ate-local "${SUBSTRATE_PORT}"
+  status_line ax-controller -
+  status_line ax-server "${SERVER_PORT}"
+  local actors
+  actors="$(container list --all 2>/dev/null | awk 'NR>1 && $1 ~ /^ate-/ {print "  " $1 "  " $5 "  " $6}' || true)"
+  echo
+  if [[ -n "${actors}" ]]; then
+    echo "Actor containers:"
+    echo "${actors}"
+  else
+    echo "Actor containers: none"
+  fi
+  if [[ "${AX_SERVER:-}" != "localhost:${SERVER_PORT}" ]]; then
+    echo
+    echo "AX_SERVER is '${AX_SERVER:-<unset>}' in this shell; run: source ${ENV_FILE#"${REPO_ROOT}/"}"
+  fi
+}
+
+cmd_logs() {
+  local name="${1:-}"
+  if [[ -z "${name}" ]]; then
+    tail -n 50 -f "${LOG_DIR}"/*.log
+  elif [[ "${name}" == "valkey" ]]; then
+    container logs --follow "${VALKEY_NAME}"
+  else
+    [[ -f "${LOG_DIR}/${name}.log" ]] || die "no log for '${name}' (components: ${COMPONENTS[*]} valkey)"
+    tail -n 50 -f "${LOG_DIR}/${name}.log"
+  fi
+}
+
+cmd_reset() {
+  cmd_down
+  local actors
+  actors="$(container list --all 2>/dev/null | awk 'NR>1 && $1 ~ /^ate-/ {print $1}' || true)"
+  for a in ${actors}; do
+    info "Removing actor container ${a}"
+    container delete --force "${a}" >/dev/null 2>&1 || true
+  done
+  cmd_up
+}
+
+case "${1:-}" in
+  up) cmd_up ;;
+  down) shift; cmd_down "$@" ;;
+  status) cmd_status ;;
+  logs) shift; cmd_logs "$@" ;;
+  reset) cmd_reset ;;
+  *) usage ;;
+esac
