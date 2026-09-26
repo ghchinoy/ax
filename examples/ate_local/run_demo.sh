@@ -23,10 +23,14 @@ if ! command -v container &> /dev/null; then
     exit 1
 fi
 
+DAEMON_PID=""
 cleanup() {
     echo "Cleaning up..."
-    kill -9 $DAEMON_PID 2>/dev/null || true
-    kill -9 $(lsof -t -i:50051) 2>/dev/null || true
+    # Only stop the ate-local this script started.
+    if [ -n "$DAEMON_PID" ]; then
+        kill "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -35,15 +39,22 @@ mkdir -p bin/linux_arm64
 go build -o bin/ate-local ./cmd/ate-local
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux_arm64/ate-worker ./examples/ate_local/worker/main.go
 
-echo "2. Cleaning up port 50051 if in use..."
-kill -9 $(lsof -t -i:50051) 2>/dev/null || true
+echo "2. Checking that port 50051 is free..."
+if OWNER_PID=$(lsof -nP -t -iTCP:50051 -sTCP:LISTEN 2>/dev/null | head -n1) && [ -n "$OWNER_PID" ]; then
+    echo "Error: port 50051 is in use by $(ps -p "$OWNER_PID" -o comm=) (pid $OWNER_PID)."
+    echo "If it is the local stack, run: examples/ate_local/local-stack.sh down"
+    exit 1
+fi
 
 echo "3. Starting ate-local daemon in background..."
 ./bin/ate-local --config examples/ate_local/ate-local.yaml &
 DAEMON_PID=$!
 
 echo "Waiting for ate-local to listen on :50051..."
-sleep 2
+for _ in $(seq 1 50); do
+    nc -z 127.0.0.1 50051 >/dev/null 2>&1 && break
+    sleep 0.2
+done
 
 echo "4. Running Substrate Control client demo..."
 go run ./examples/ate_local/demo_client.go --actor demo-actor-live --template ax-harness-demo-template
