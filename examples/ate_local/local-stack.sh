@@ -15,11 +15,12 @@
 
 # local-stack.sh runs the full AX stack on macOS without Kubernetes:
 #
-#   ax CLI -> ax-server -> Valkey -> ax-controller -> ate-local -> Apple container
+#   ax CLI -> ax-server -> ate-local -> Apple container
+#                \-> Valkey (resource store, locks, pubsub)
 #
 # Components are started in dependency order, and each one must accept
-# connections before the next starts. This keeps ax-controller from starting
-# before ate-local and sitting in gRPC reconnect backoff.
+# connections before the next starts. This keeps ax-server from starting
+# before ate-local or Valkey and sitting in gRPC reconnect backoff.
 #
 # Usage: examples/ate_local/local-stack.sh {up|down|status|logs [component]|reset}
 #
@@ -51,7 +52,7 @@ HOST="127.0.0.1"
 WAIT_SECONDS=30
 
 # Processes this script manages, in start order.
-COMPONENTS=(ate-local ax-controller ax-server)
+COMPONENTS=(ate-local ax-server)
 
 info() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -128,7 +129,6 @@ build() {
   info "Building binaries into ${BIN_DIR}"
   mkdir -p "${BIN_DIR}/linux_arm64"
   go build -o "${BIN_DIR}/ate-local" ./cmd/ate-local
-  go build -o "${BIN_DIR}/ax-controller" ./cmd/ax-controller
   go build -o "${BIN_DIR}/ax-server" ./cmd/ax-server
   go build -o "${BIN_DIR}/ax" ./cmd/ax
   # Apple container runs arm64 Linux guests; the published ax-task-runner image is amd64.
@@ -142,8 +142,8 @@ write_config() {
 address: "${HOST}:${SUBSTRATE_PORT}"
 ready_timeout: "20s"
 templates:
-  # ax-controller creates one ActorTemplate per Task. ate-local copies this
-  # template's volumes into each one, so every Task gets the arm64 runner.
+  # ate-local copies this template's volumes into each custom template,
+  # so every Task gets the arm64 runner.
   default:
     image: "debian:12"
     port: 80
@@ -231,22 +231,14 @@ cmd_up() {
   start_valkey
   start_component ate-local "${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ate-local" --config "${CONFIG_FILE}"
-  # ax-controller has no listening port; it depends on Valkey and ate-local.
-  if alive ax-controller; then
-    info "ax-controller already running (pid $(pid_of ax-controller))"
-  else
-    info "Starting ax-controller"
-    nohup "${BIN_DIR}/ax-controller" \
-      --substrate-endpoint "${HOST}:${SUBSTRATE_PORT}" \
-      --substrate-plaintext \
-      --redis-addr "${HOST}:${REDIS_PORT}" \
-      >"${LOG_DIR}/ax-controller.log" 2>&1 &
-    echo $! >"${PID_DIR}/ax-controller.pid"
-    sleep 1
-    alive ax-controller || { tail -n 20 "${LOG_DIR}/ax-controller.log" >&2; die "ax-controller exited; see ${LOG_DIR}/ax-controller.log"; }
-  fi
   start_component ax-server "${SERVER_PORT}" \
-    "${BIN_DIR}/ax-server" --addr "${HOST}:${SERVER_PORT}" --redis-addr "${HOST}:${REDIS_PORT}"
+    "${BIN_DIR}/ax-server" \
+    --addr "${HOST}:${SERVER_PORT}" \
+    --redis-addr "${HOST}:${REDIS_PORT}" \
+    --substrate-endpoint "${HOST}:${SUBSTRATE_PORT}" \
+    --substrate-plaintext \
+    --template default \
+    --template-atespace default
 
   echo
   cmd_status
@@ -277,7 +269,6 @@ cmd_down() {
   [[ "${1:-}" == "--keep-valkey" ]] && keep_valkey=yes
   # Stop in reverse dependency order.
   stop_component ax-server
-  stop_component ax-controller
   stop_component ate-local
   if [[ "${keep_valkey}" == "no" ]] && valkey_exists; then
     info "Removing Valkey container ${VALKEY_NAME}"
@@ -311,7 +302,6 @@ cmd_status() {
   printf '%-14s %-10s %-10s %-8s %s\n' COMPONENT STATE PID PORT REACHABLE
   status_line valkey "${REDIS_PORT}"
   status_line ate-local "${SUBSTRATE_PORT}"
-  status_line ax-controller -
   status_line ax-server "${SERVER_PORT}"
   local actors
   actors="$(container list --all 2>/dev/null | awk 'NR>1 && $1 ~ /^ate-/ {print "  " $1 "  " $5 "  " $6}' || true)"

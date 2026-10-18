@@ -46,7 +46,7 @@ run-ate-local: build-ate-local
 	@echo "==> Running ate-local daemon..."
 	./bin/ate-local --config examples/ate_local/ate-local.yaml
 
-# Full local AX stack on macOS (Valkey, ate-local, ax-controller, ax-server)
+# Full local AX stack on macOS (Valkey, ate-local, ax-server)
 # backed by Apple container. See docs/ate-local.md.
 local-up:
 	./examples/ate_local/local-stack.sh up

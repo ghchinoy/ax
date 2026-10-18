@@ -83,7 +83,9 @@ func main() {
 	actor := resumeResp.GetActor()
 	var workerIP string
 	if actor.GetStatus() != nil && actor.GetStatus().GetWorkerAssignment() != nil {
-		workerIP = actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp()
+		if ips := actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(); len(ips) > 0 {
+			workerIP = ips[0]
+		}
 	}
 	fmt.Printf("   Actor resumed! Container Name: %s, Worker IP: %s, State: %v\n",
 		actor.GetMetadata().GetName(), workerIP, actor.GetStatus().GetState())
