@@ -52,8 +52,8 @@ func (r *ActorRecord) toProto() *ateapipb.Actor {
 			Worker: &ateapipb.ObjectRef{
 				Name: r.ContainerName,
 			},
-			WorkerPod:   r.ContainerName,
-			WorkerPodIp: r.ContainerIP,
+			WorkerPod:    r.ContainerName,
+			WorkerPodIps: []string{r.ContainerIP},
 		}
 	}
 	return &ateapipb.Actor{
@@ -81,9 +81,9 @@ type Server struct {
 
 	mu             sync.RWMutex
 	atespaces      map[string]bool
-	templates      map[string]TemplateConfig          // key: atespace/name
-	actors         map[string]*ActorRecord            // key: atespace/name
-	egressPolicies map[string]*ateapipb.EgressPolicy  // key: atespace/actorName
+	templates      map[string]TemplateConfig         // key: atespace/name
+	actors         map[string]*ActorRecord           // key: atespace/name
+	egressPolicies map[string]*ateapipb.EgressPolicy // key: atespace/actorName
 }
 
 // NewServer creates a new local Substrate Control server instance.
@@ -269,8 +269,8 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 				tc.Env[env.GetName()] = env.GetValue()
 			}
 		}
-		if c.GetReadyz() != nil && c.GetReadyz().GetHttpGet() != nil && c.GetReadyz().GetHttpGet().GetPort() > 0 {
-			tc.Port = int(c.GetReadyz().GetHttpGet().GetPort())
+		if c.GetWakeupProbe() != nil && c.GetWakeupProbe().GetHttpGet() != nil && c.GetWakeupProbe().GetHttpGet().GetPort() > 0 {
+			tc.Port = int(c.GetWakeupProbe().GetHttpGet().GetPort())
 		}
 	}
 	if tc.Image == "" {
@@ -626,6 +626,35 @@ func (s *Server) PauseActor(ctx context.Context, req *ateapipb.PauseActorRequest
 	return &ateapipb.PauseActorResponse{}, nil
 }
 
+// RevertActor reverts a crashed, running or paused actor to SUSPENDED state.
+func (s *Server) RevertActor(ctx context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
+	ref := req.GetActor()
+	if ref == nil || ref.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "actor ref is required")
+	}
+
+	key := resourceKey(ref.GetAtespace(), ref.GetName())
+
+	s.mu.Lock()
+	actor, ok := s.actors[key]
+	s.mu.Unlock()
+
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "actor %q not found", key)
+	}
+
+	_, _ = s.runner.Run(ctx, "stop", "--time", "2", actor.ContainerName)
+
+	s.mu.Lock()
+	actor.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	actor.ContainerIP = ""
+	s.mu.Unlock()
+
+	return &ateapipb.RevertActorResponse{
+		Actor: actor.toProto(),
+	}, nil
+}
+
 // GetActor retrieves an Actor by atespace and name.
 func (s *Server) GetActor(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
 	ref := req.GetActor()
@@ -780,7 +809,7 @@ func (s *Server) ListWorkers(ctx context.Context, req *ateapipb.ListWorkersReque
 		if a.State == ateapipb.ActorState_ACTOR_STATE_RUNNING {
 			workers = append(workers, &ateapipb.Worker{
 				WorkerPod: a.ContainerName,
-				Ip:        a.ContainerIP,
+				Ips:       []string{a.ContainerIP},
 			})
 		}
 	}
