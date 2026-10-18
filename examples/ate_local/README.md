@@ -10,7 +10,7 @@ It allows upstream `ax` (and other Substrate clients) to run agent harnesses ins
 
 ```
                  +--------------------------------+
-                 |       AX Controller / CLI      |
+                 |    ax-server (TaskReconciler)  |
                  +---------------+----------------+
                                  |
                  Control gRPC    | (CreateActor, ResumeActor, SuspendActor)
@@ -44,8 +44,8 @@ It allows upstream `ax` (and other Substrate clients) to run agent harnesses ins
 2. **`ResumeActor`**:
    - Launches an Apple container for the actor (`container run -d --name ate-<atespace>-<name> ...`).
    - Retrieves the container's routable IP on the macOS `vmnet` bridge (`192.168.64.x`).
-   - Returns the IP as `Actor.Status.WorkerAssignment.WorkerPodIp`.
-   - AX then connects to `WorkerPodIp` directly to check `/readyz` and stream execution turns.
+   - Returns the IP as `Actor.Status.WorkerAssignment.WorkerPodIps[0]`.
+   - AX then connects to `WorkerPodIps[0]` directly to check `/readyz` and stream execution turns.
 3. **`SuspendActor`**: Stops the container (`container stop`), freeing up CPU and memory resources on the Mac.
 4. **`DeleteActor`**: Tears down and deletes the container (`container delete --force`).
 
@@ -53,7 +53,7 @@ It allows upstream `ax` (and other Substrate clients) to run agent harnesses ins
 
 ## Full AX Stack Quickstart
 
-To run real AX Tasks (`ax apply`, `ax resume`, `ax ssh`) against Apple containers, start the whole stack: Valkey, `ate-local`, `ax-controller` and `ax-server`.
+To run real AX Tasks (`ax apply`, `ax resume`, `ax ssh`) against Apple containers, start the whole stack: Valkey, `ate-local`, and `ax-server`.
 
 ```bash
 make local-up
