@@ -188,10 +188,12 @@ func TestControlServer_ActorLifecycle(t *testing.T) {
 	actor := resumeResp.GetActor()
 	workerIP := ""
 	if actor.GetStatus() != nil && actor.GetStatus().GetWorkerAssignment() != nil {
-		workerIP = actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp()
+		if ips := actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(); len(ips) > 0 {
+			workerIP = ips[0]
+		}
 	}
 	if workerIP != "127.0.0.1" {
-		t.Errorf("ResumeActor(%q).Status.WorkerAssignment.WorkerPodIp = %q, want %q", actorName, workerIP, "127.0.0.1")
+		t.Errorf("ResumeActor(%q).Status.WorkerAssignment.WorkerPodIps[0] = %q, want %q", actorName, workerIP, "127.0.0.1")
 	}
 	if got := actor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RUNNING {
 		t.Errorf("ResumeActor(%q).Status.State = %v, want %v", actorName, got, ateapipb.ActorState_ACTOR_STATE_RUNNING)
@@ -247,6 +249,42 @@ func TestControlServer_ActorLifecycle(t *testing.T) {
 	}
 	if !hadDelete {
 		t.Errorf("runner.runCalls missing 'delete' command; calls were %v", runner.runCalls)
+	}
+}
+
+func TestControlServer_RevertActor(t *testing.T) {
+	runner := &mockRunner{created: make(map[string]bool)}
+	cfg := DefaultConfig()
+	cfg.Runner = runner
+
+	client, cleanup := startTestControlServer(t, cfg)
+	defer cleanup()
+
+	ctx := t.Context()
+	actorName := "revert-actor"
+
+	// 1. Create Actor
+	_, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "ax",
+				Name:     actorName,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	// 2. RevertActor returns state SUSPENDED
+	revertResp, err := client.RevertActor(ctx, &ateapipb.RevertActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "ax", Name: actorName},
+	})
+	if err != nil {
+		t.Fatalf("RevertActor failed: %v", err)
+	}
+	if got := revertResp.GetActor().GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("RevertActor state = %v, want SUSPENDED", got)
 	}
 }
 
@@ -520,13 +558,15 @@ func TestControlServer_LiveAppleContainer(t *testing.T) {
 	actor := resumeResp.GetActor()
 	workerIP := ""
 	if actor.GetStatus() != nil && actor.GetStatus().GetWorkerAssignment() != nil {
-		workerIP = actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp()
+		if ips := actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(); len(ips) > 0 {
+			workerIP = ips[0]
+		}
 	}
 	t.Logf("Live Actor resumed in Apple Container: ID=%s, IP=%s, State=%v",
 		actor.GetMetadata().GetName(), workerIP, actor.GetStatus().GetState())
 
 	if workerIP == "" {
-		t.Errorf("ResumeActor(%q).Status.WorkerAssignment.WorkerPodIp = %q, want non-empty IP", testActorName, workerIP)
+		t.Errorf("ResumeActor(%q).Status.WorkerAssignment.WorkerPodIps = %v, want non-empty IP", testActorName, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps())
 	}
 
 	// 3. Suspend Actor
