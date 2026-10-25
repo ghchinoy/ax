@@ -273,6 +273,18 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 			tc.Port = int(c.GetWakeupProbe().GetHttpGet().GetPort())
 		}
 	}
+	if tmpl.GetResources() != nil {
+		for _, l := range tmpl.GetResources().GetLimits() {
+			if l.GetName() == "cpu" {
+				var cpuCount int
+				if _, err := fmt.Sscanf(l.GetQuantity(), "%d", &cpuCount); err == nil && cpuCount > 0 {
+					tc.CPUs = cpuCount
+				}
+			} else if l.GetName() == "memory" {
+				tc.Memory = l.GetQuantity()
+			}
+		}
+	}
 	if tc.Image == "" {
 		tc.Image = "debian:12"
 	}
@@ -619,7 +631,7 @@ func (s *Server) PauseActor(ctx context.Context, req *ateapipb.PauseActorRequest
 	_, _ = s.runner.Run(ctx, "stop", "--time", "2", actor.ContainerName)
 
 	s.mu.Lock()
-	actor.State = ateapipb.ActorState_ACTOR_STATE_PAUSED
+	actor.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 	actor.ContainerIP = ""
 	s.mu.Unlock()
 
