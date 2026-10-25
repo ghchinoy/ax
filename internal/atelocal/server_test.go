@@ -445,7 +445,7 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 	}
 	defer subClient.Close()
 
-	reconciler := controller.NewTaskReconciler(subClient, "default", "default")
+	reconciler := controller.NewTaskReconciler(subClient, "default", "default", "")
 	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
 		return "test-gemini-key", nil
 	}
@@ -467,7 +467,7 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 	}
 
 	// 1. Reconcile active task -> should transition to Running and Ready=True, WorkspaceReady=True
-	reconciled, err := reconciler.Reconcile(ctx, task)
+	reconciled, err := reconciler.Reconcile(ctx, task, nil)
 	if err != nil {
 		t.Fatalf("Reconcile(active) failed: %v", err)
 	}
@@ -488,7 +488,7 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 
 	// 2. Reconcile suspend -> should transition to Suspended
 	reconciled.Status.Phase = "Suspended"
-	suspended, err := reconciler.Reconcile(ctx, reconciled)
+	suspended, err := reconciler.Reconcile(ctx, reconciled, nil)
 	if err != nil {
 		t.Fatalf("Reconcile(suspend) failed: %v", err)
 	}
@@ -645,7 +645,7 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 	}
 	defer subClient.Close()
 
-	reconciler := controller.NewTaskReconciler(subClient, "default", "default")
+	reconciler := controller.NewTaskReconciler(subClient, "default", "default", "")
 	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
 		return "live-test-key", nil
 	}
@@ -671,7 +671,7 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 		},
 	}
 
-	reconciled, err := reconciler.Reconcile(ctx, task)
+	reconciled, err := reconciler.Reconcile(ctx, task, nil)
 	if err != nil {
 		t.Fatalf("Reconcile(%q) failed: %v", taskName, err)
 	}
