@@ -29,11 +29,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/guest"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -446,9 +446,6 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 	defer subClient.Close()
 
 	reconciler := controller.NewTaskReconciler(subClient, "default", "default", "")
-	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
-		return "test-gemini-key", nil
-	}
 	reconciler.WorkspaceReadyTimeout = 2 * time.Second
 
 	ctx := t.Context()
@@ -466,39 +463,37 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 		},
 	}
 
-	// 1. Reconcile active task -> should transition to Running and Ready=True, WorkspaceReady=True
-	reconciled, err := reconciler.Reconcile(ctx, task, nil)
-	if err != nil {
-		t.Fatalf("Reconcile(active) failed: %v", err)
+	// 1. Resume active task -> should set WorkspaceReady=True
+	if err := reconciler.Resume(ctx, task, nil); err != nil {
+		t.Fatalf("Resume failed: %v", err)
 	}
-	if reconciled.GetStatus().GetPhase() != "Running" {
-		t.Errorf("Phase = %q, want Running", reconciled.GetStatus().GetPhase())
-	}
-	for _, wantCond := range []string{"WorkspaceReady", "Ready"} {
+	for _, wantCond := range []string{"WorkspaceReady"} {
 		foundTrue := false
-		for _, c := range reconciled.GetStatus().GetConditions() {
+		for _, c := range task.GetStatus().GetConditions() {
 			if c.GetType() == wantCond && c.GetStatus() == "True" {
 				foundTrue = true
 			}
 		}
 		if !foundTrue {
-			t.Errorf("expected condition %q=True on reconciled task, got conditions: %v", wantCond, reconciled.GetStatus().GetConditions())
+			t.Errorf("expected condition %q=True on resumed task, got conditions: %v", wantCond, task.GetStatus().GetConditions())
 		}
 	}
 
-	// 2. Reconcile suspend -> should transition to Suspended
-	reconciled.Status.Phase = "Suspended"
-	suspended, err := reconciler.Reconcile(ctx, reconciled, nil)
-	if err != nil {
-		t.Fatalf("Reconcile(suspend) failed: %v", err)
+	// 2. Suspend -> should suspend actor on ate-local
+	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+		t.Fatalf("Suspend failed: %v", err)
 	}
-	if suspended.GetStatus().GetPhase() != "Suspended" {
-		t.Errorf("Phase after suspend = %q, want Suspended", suspended.GetStatus().GetPhase())
+	actor, err := subClient.GetActor(ctx, "default", "e2e-task")
+	if err != nil {
+		t.Fatalf("GetActor after suspend failed: %v", err)
+	}
+	if got := actor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("Actor state after suspend = %v, want SUSPENDED", got)
 	}
 
-	// 3. ReconcileDelete -> should delete both actor and per-task ActorTemplate
-	if err := reconciler.ReconcileDelete(ctx, "default", "e2e-task"); err != nil {
-		t.Fatalf("ReconcileDelete failed: %v", err)
+	// 3. Delete -> should delete both actor and per-task ActorTemplate
+	if err := reconciler.Delete(ctx, "default", "e2e-task"); err != nil {
+		t.Fatalf("Delete failed: %v", err)
 	}
 }
 
@@ -646,14 +641,11 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 	defer subClient.Close()
 
 	reconciler := controller.NewTaskReconciler(subClient, "default", "default", "")
-	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
-		return "live-test-key", nil
-	}
 	reconciler.WorkspaceReadyTimeout = 10 * time.Second
 
 	taskName := fmt.Sprintf("live-task-%d", time.Now().UnixNano()%100000)
 	defer func() {
-		_ = reconciler.ReconcileDelete(context.Background(), "default", taskName)
+		_ = reconciler.Delete(context.Background(), "default", taskName)
 	}()
 
 	task := &v1alpha1.Task{
@@ -671,26 +663,29 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 		},
 	}
 
-	reconciled, err := reconciler.Reconcile(ctx, task, nil)
+	if err := reconciler.Resume(ctx, task, nil); err != nil {
+		t.Fatalf("Resume(%q) failed: %v", taskName, err)
+	}
+
+	actor, err := subClient.GetActor(ctx, "default", taskName)
 	if err != nil {
-		t.Fatalf("Reconcile(%q) failed: %v", taskName, err)
+		t.Fatalf("GetActor(%q) failed: %v", taskName, err)
 	}
+	workerIP := substrate.WorkerIP(actor)
+	t.Logf("Live Task resumed: name=%s, workerIP=%s, actorState=%v", taskName, workerIP, actor.GetStatus().GetState())
 
-	workerIP := reconciled.GetStatus().GetWorkerIp()
-	t.Logf("Live Task reconciled: name=%s, workerIP=%s, phase=%s", taskName, workerIP, reconciled.GetStatus().GetPhase())
-
-	if reconciled.GetStatus().GetPhase() != "Running" {
-		t.Fatalf("Phase = %q, want Running", reconciled.GetStatus().GetPhase())
+	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		t.Fatalf("Actor state = %v, want RUNNING", actor.GetStatus().GetState())
 	}
-	for _, wantCond := range []string{"WorkspaceReady", "Ready"} {
+	for _, wantCond := range []string{"WorkspaceReady"} {
 		foundTrue := false
-		for _, c := range reconciled.GetStatus().GetConditions() {
+		for _, c := range task.GetStatus().GetConditions() {
 			if c.GetType() == wantCond && c.GetStatus() == "True" {
 				foundTrue = true
 			}
 		}
 		if !foundTrue {
-			t.Errorf("expected condition %q=True on live task, got: %v", wantCond, reconciled.GetStatus().GetConditions())
+			t.Errorf("expected condition %q=True on live task, got: %v", wantCond, task.GetStatus().GetConditions())
 		}
 	}
 

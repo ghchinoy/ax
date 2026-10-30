@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -273,16 +273,20 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 			tc.Port = int(c.GetWakeupProbe().GetHttpGet().GetPort())
 		}
 	}
-	if tmpl.GetResources() != nil {
-		for _, l := range tmpl.GetResources().GetLimits() {
-			if l.GetName() == "cpu" {
-				var cpuCount int
-				if _, err := fmt.Sscanf(l.GetQuantity(), "%d", &cpuCount); err == nil && cpuCount > 0 {
-					tc.CPUs = cpuCount
-				}
-			} else if l.GetName() == "memory" {
-				tc.Memory = l.GetQuantity()
+	if limits := tmpl.GetResources().GetLimits(); limits != nil {
+		if cpuMillis := limits.GetCpuMillicores(); cpuMillis > 0 {
+			cpus := int((cpuMillis + 999) / 1000)
+			if cpus < 1 {
+				cpus = 1
 			}
+			tc.CPUs = cpus
+		}
+		if memBytes := limits.GetMemoryBytes(); memBytes > 0 {
+			memMB := memBytes / (1024 * 1024)
+			if memMB < 1 {
+				memMB = 1
+			}
+			tc.Memory = fmt.Sprintf("%dM", memMB)
 		}
 	}
 	if tc.Image == "" {
@@ -611,34 +615,7 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 	return &ateapipb.SuspendActorResponse{}, nil
 }
 
-// PauseActor pauses the Actor's container.
-func (s *Server) PauseActor(ctx context.Context, req *ateapipb.PauseActorRequest) (*ateapipb.PauseActorResponse, error) {
-	ref := req.GetActor()
-	if ref == nil || ref.GetName() == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "actor ref is required")
-	}
-
-	key := resourceKey(ref.GetAtespace(), ref.GetName())
-
-	s.mu.Lock()
-	actor, ok := s.actors[key]
-	s.mu.Unlock()
-
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "actor %q not found", key)
-	}
-
-	_, _ = s.runner.Run(ctx, "stop", "--time", "2", actor.ContainerName)
-
-	s.mu.Lock()
-	actor.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
-	actor.ContainerIP = ""
-	s.mu.Unlock()
-
-	return &ateapipb.PauseActorResponse{}, nil
-}
-
-// RevertActor reverts a crashed, running or paused actor to SUSPENDED state.
+// RevertActor reverts a crashed or running actor to SUSPENDED state.
 func (s *Server) RevertActor(ctx context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
 	ref := req.GetActor()
 	if ref == nil || ref.GetName() == "" {
@@ -821,7 +798,6 @@ func (s *Server) ListWorkers(ctx context.Context, req *ateapipb.ListWorkersReque
 		if a.State == ateapipb.ActorState_ACTOR_STATE_RUNNING {
 			workers = append(workers, &ateapipb.Worker{
 				WorkerPod: a.ContainerName,
-				Ips:       []string{a.ContainerIP},
 			})
 		}
 	}

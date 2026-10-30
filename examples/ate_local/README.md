@@ -53,7 +53,7 @@ It allows upstream `ax` (and other Substrate clients) to run agent harnesses ins
 
 ## Full AX Stack Quickstart
 
-To run real AX Tasks (`ax apply`, `ax resume`, `ax ssh`) against Apple containers, start the whole stack: Valkey, `ate-local`, and `ax-server`.
+To run real AX Tasks (`ax apply`, `ax resume`, `ax ssh`) against Apple containers, start the whole stack: PostgreSQL, `ate-local`, and `ax-server`.
 
 ```bash
 make local-up
@@ -68,7 +68,7 @@ ax delete task local-task
 make local-down
 ```
 
-See [docs/ate-local.md](../../docs/ate-local.md) for the helper's commands, what AX needs from Redis, and troubleshooting.
+See [docs/ate-local.md](../../docs/ate-local.md) for the helper's commands, what AX needs from PostgreSQL, and troubleshooting.
 
 ## Control Plane Demo
 

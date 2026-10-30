@@ -16,20 +16,20 @@
 # local-stack.sh runs the full AX stack on macOS without Kubernetes:
 #
 #   ax CLI -> ax-server -> ate-local -> Apple container
-#                \-> Valkey (resource store, locks, pubsub)
+#                \-> PostgreSQL (resource store, locks)
 #
 # Components are started in dependency order, and each one must accept
 # connections before the next starts. This keeps ax-server from starting
-# before ate-local or Valkey and sitting in gRPC reconnect backoff.
+# before ate-local or PostgreSQL and sitting in gRPC reconnect backoff.
 #
 # Usage: examples/ate_local/local-stack.sh {up|down|status|logs [component]|reset}
 #
 # Ports and names can be overridden with environment variables:
-#   AX_LOCAL_REDIS_PORT      (default 6379)
+#   AX_LOCAL_POSTGRES_PORT   (default 5432)
 #   AX_LOCAL_SUBSTRATE_PORT  (default 50051)
 #   AX_LOCAL_SERVER_PORT     (default 8090; 8080 is avoided because it is a common default)
-#   AX_LOCAL_VALKEY_NAME     (default ax-local-valkey)
-#   AX_LOCAL_VALKEY_IMAGE    (default valkey/valkey:8-alpine)
+#   AX_LOCAL_POSTGRES_NAME   (default ax-local-postgres)
+#   AX_LOCAL_POSTGRES_IMAGE  (default postgres:17-alpine)
 #   AX_LOCAL_DIR             (default ./.ax-local)
 
 set -euo pipefail
@@ -37,11 +37,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-REDIS_PORT="${AX_LOCAL_REDIS_PORT:-6379}"
+POSTGRES_PORT="${AX_LOCAL_POSTGRES_PORT:-5432}"
 SUBSTRATE_PORT="${AX_LOCAL_SUBSTRATE_PORT:-50051}"
 SERVER_PORT="${AX_LOCAL_SERVER_PORT:-8090}"
-VALKEY_NAME="${AX_LOCAL_VALKEY_NAME:-ax-local-valkey}"
-VALKEY_IMAGE="${AX_LOCAL_VALKEY_IMAGE:-valkey/valkey:8-alpine}"
+POSTGRES_NAME="${AX_LOCAL_POSTGRES_NAME:-ax-local-postgres}"
+POSTGRES_IMAGE="${AX_LOCAL_POSTGRES_IMAGE:-postgres:17-alpine}"
 STATE_DIR="${AX_LOCAL_DIR:-${REPO_ROOT}/.ax-local}"
 BIN_DIR="${STATE_DIR}/bin"
 PID_DIR="${STATE_DIR}/pids"
@@ -97,12 +97,12 @@ alive() {
   [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
 }
 
-valkey_running() {
-  container list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "${VALKEY_NAME}"
+postgres_running() {
+  container list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "${POSTGRES_NAME}"
 }
 
-valkey_exists() {
-  container list --all 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "${VALKEY_NAME}"
+postgres_exists() {
+  container list --all 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "${POSTGRES_NAME}"
 }
 
 check_prereqs() {
@@ -162,21 +162,29 @@ export PATH="${BIN_DIR}:\${PATH}"
 EOF
 }
 
-start_valkey() {
-  if valkey_running; then
-    info "Valkey already running (${VALKEY_NAME})"
+start_postgres() {
+  if postgres_running; then
+    info "PostgreSQL already running (${POSTGRES_NAME})"
   else
-    check_port "Valkey" "${REDIS_PORT}" no
-    if valkey_exists; then
-      info "Starting existing Valkey container ${VALKEY_NAME}"
-      container start "${VALKEY_NAME}" >/dev/null
+    check_port "PostgreSQL" "${POSTGRES_PORT}" no
+    if postgres_exists; then
+      info "Starting existing PostgreSQL container ${POSTGRES_NAME}"
+      container start "${POSTGRES_NAME}" >/dev/null
     else
-      info "Starting Valkey (${VALKEY_IMAGE}) in Apple container"
-      container run -d --progress none --name "${VALKEY_NAME}" \
-        -p "${HOST}:${REDIS_PORT}:6379" --memory 256M "${VALKEY_IMAGE}" >/dev/null
+      info "Starting PostgreSQL (${POSTGRES_IMAGE}) in Apple container"
+      container run -d --progress none --name "${POSTGRES_NAME}" \
+        -e POSTGRES_USER=ax -e POSTGRES_PASSWORD=ax -e POSTGRES_DB=ax \
+        -p "${HOST}:${POSTGRES_PORT}:5432" --memory 512M "${POSTGRES_IMAGE}" >/dev/null
     fi
   fi
-  wait_for_port "Valkey" "${REDIS_PORT}"
+  wait_for_port "PostgreSQL" "${POSTGRES_PORT}"
+  local deadline=$((SECONDS + WAIT_SECONDS))
+  while ! container exec "${POSTGRES_NAME}" pg_isready -U ax -d ax >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      die "PostgreSQL did not become ready within ${WAIT_SECONDS}s"
+    fi
+    sleep 0.2
+  done
 }
 
 start_component() {
@@ -220,7 +228,7 @@ cmd_up() {
   mkdir -p "${PID_DIR}" "${LOG_DIR}"
 
   # Fail before building anything if a port is taken by something else.
-  valkey_running || check_port "Valkey" "${REDIS_PORT}" no
+  postgres_running || check_port "PostgreSQL" "${POSTGRES_PORT}" no
   alive ate-local || check_port "ate-local" "${SUBSTRATE_PORT}" no
   alive ax-server || check_port "ax-server" "${SERVER_PORT}" no
 
@@ -228,13 +236,13 @@ cmd_up() {
   write_config
   write_env
 
-  start_valkey
+  start_postgres
   start_component ate-local "${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ate-local" --config "${CONFIG_FILE}"
   start_component ax-server "${SERVER_PORT}" \
     "${BIN_DIR}/ax-server" \
     --addr "${HOST}:${SERVER_PORT}" \
-    --redis-addr "${HOST}:${REDIS_PORT}" \
+    --store "postgres://ax:ax@${HOST}:${POSTGRES_PORT}/ax?sslmode=disable" \
     --substrate-endpoint "${HOST}:${SUBSTRATE_PORT}" \
     --substrate-plaintext \
     --template default \
@@ -265,14 +273,14 @@ EOF
 }
 
 cmd_down() {
-  local keep_valkey=no
-  [[ "${1:-}" == "--keep-valkey" ]] && keep_valkey=yes
+  local keep_postgres=no
+  [[ "${1:-}" == "--keep-postgres" || "${1:-}" == "--keep-db" ]] && keep_postgres=yes
   # Stop in reverse dependency order.
   stop_component ax-server
   stop_component ate-local
-  if [[ "${keep_valkey}" == "no" ]] && valkey_exists; then
-    info "Removing Valkey container ${VALKEY_NAME}"
-    container delete --force "${VALKEY_NAME}" >/dev/null 2>&1 || true
+  if [[ "${keep_postgres}" == "no" ]] && postgres_exists; then
+    info "Removing PostgreSQL container ${POSTGRES_NAME}"
+    container delete --force "${POSTGRES_NAME}" >/dev/null 2>&1 || true
   fi
   # ate-local stops actor containers on shutdown; report any that remain.
   local leftovers
@@ -285,8 +293,8 @@ cmd_down() {
 
 status_line() {
   local name="$1" port="$2" state="stopped" pid="-"
-  if [[ "${name}" == "valkey" ]]; then
-    valkey_running && state="running" && pid="container"
+  if [[ "${name}" == "postgres" ]]; then
+    postgres_running && state="running" && pid="container"
   elif alive "${name}"; then
     state="running"
     pid="$(pid_of "${name}")"
@@ -300,7 +308,7 @@ status_line() {
 
 cmd_status() {
   printf '%-14s %-10s %-10s %-8s %s\n' COMPONENT STATE PID PORT REACHABLE
-  status_line valkey "${REDIS_PORT}"
+  status_line postgres "${POSTGRES_PORT}"
   status_line ate-local "${SUBSTRATE_PORT}"
   status_line ax-server "${SERVER_PORT}"
   local actors
@@ -322,10 +330,10 @@ cmd_logs() {
   local name="${1:-}"
   if [[ -z "${name}" ]]; then
     tail -n 50 -f "${LOG_DIR}"/*.log
-  elif [[ "${name}" == "valkey" ]]; then
-    container logs --follow "${VALKEY_NAME}"
+  elif [[ "${name}" == "postgres" ]]; then
+    container logs --follow "${POSTGRES_NAME}"
   else
-    [[ -f "${LOG_DIR}/${name}.log" ]] || die "no log for '${name}' (components: ${COMPONENTS[*]} valkey)"
+    [[ -f "${LOG_DIR}/${name}.log" ]] || die "no log for '${name}' (components: ${COMPONENTS[*]} postgres)"
     tail -n 50 -f "${LOG_DIR}/${name}.log"
   fi
 }
