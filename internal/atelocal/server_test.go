@@ -29,11 +29,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/guest"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -446,9 +446,6 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 	defer subClient.Close()
 
 	reconciler := controller.NewTaskReconciler(subClient, "default", "default", "")
-	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
-		return "test-gemini-key", nil
-	}
 	reconciler.WorkspaceReadyTimeout = 2 * time.Second
 
 	ctx := t.Context()
@@ -466,7 +463,7 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 		},
 	}
 
-	// 1. Reconcile active task -> should transition to Running and Ready=True, WorkspaceReady=True
+	// 1. Reconcile active task -> should transition to Running and WorkspaceReady=True
 	reconciled, err := reconciler.Reconcile(ctx, task, nil)
 	if err != nil {
 		t.Fatalf("Reconcile(active) failed: %v", err)
@@ -474,7 +471,7 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 	if reconciled.GetStatus().GetPhase() != "Running" {
 		t.Errorf("Phase = %q, want Running", reconciled.GetStatus().GetPhase())
 	}
-	for _, wantCond := range []string{"WorkspaceReady", "Ready"} {
+	for _, wantCond := range []string{"WorkspaceReady"} {
 		foundTrue := false
 		for _, c := range reconciled.GetStatus().GetConditions() {
 			if c.GetType() == wantCond && c.GetStatus() == "True" {
@@ -646,9 +643,6 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 	defer subClient.Close()
 
 	reconciler := controller.NewTaskReconciler(subClient, "default", "default", "")
-	reconciler.SecretResolver = func(ctx context.Context, ns, name, key string) (string, error) {
-		return "live-test-key", nil
-	}
 	reconciler.WorkspaceReadyTimeout = 10 * time.Second
 
 	taskName := fmt.Sprintf("live-task-%d", time.Now().UnixNano()%100000)
@@ -682,7 +676,7 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 	if reconciled.GetStatus().GetPhase() != "Running" {
 		t.Fatalf("Phase = %q, want Running", reconciled.GetStatus().GetPhase())
 	}
-	for _, wantCond := range []string{"WorkspaceReady", "Ready"} {
+	for _, wantCond := range []string{"WorkspaceReady"} {
 		foundTrue := false
 		for _, c := range reconciled.GetStatus().GetConditions() {
 			if c.GetType() == wantCond && c.GetStatus() == "True" {
