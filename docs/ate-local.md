@@ -1,15 +1,15 @@
 # Local Agent Substrate on Apple Container (`ate-local`)
 
-`ate-local` is a lightweight, local control plane that implements the **Agent Substrate Control API** (`github.com/agent-substrate/substrate/pkg/proto/ateapipb.ControlServer`), backed by the native macOS **Apple `container`** CLI runtime (`/usr/local/bin/container`).
+`ate-local` is a lightweight, local control plane that implements the **Agent Substrate Control API** (`go.ate.dev/substrate/pkg/proto/ateapipb.ControlServer`), backed by the native macOS **Apple `container`** CLI runtime (`/usr/local/bin/container`).
 
 ---
 
 ## Why `ate-local`?
 
-Agent Substrate is designed for high-density, multi-tenant agent execution on Kubernetes with gVisor. However, for local development on macOS, running a full Kubernetes cluster (`kind` or GKE), Valkey/Redis, GCS, and Envoy proxies is heavy and complex.
+Agent Substrate is designed for high-density, multi-tenant agent execution on Kubernetes with gVisor. However, for local development on macOS, running a full Kubernetes cluster (`kind` or GKE), gVisor, GCS, and Envoy proxies is heavy and complex.
 
 `ate-local` provides a local alternative:
-- Speaks the exact same `Control` gRPC API (`CreateActor`, `ResumeActor`, `SuspendActor`, `DeleteActor`, `ListActors`) that AX uses when communicating with Agent Substrate.
+- Speaks the exact same `Control` gRPC API (`CreateActor`, `ResumeActor`, `SuspendActor`, `RevertActor`, `DeleteActor`, `ListActors`) that AX uses when communicating with Agent Substrate.
 - Backed by native macOS Apple containers running on the lightweight macOS virtualization framework.
 - Each resumed actor receives a real, routable IPv4 address on the `vmnet` bridge (`192.168.64.x`), enabling direct gRPC streaming turns to the actor.
 
@@ -20,7 +20,7 @@ Agent Substrate is designed for high-density, multi-tenant agent execution on Ku
 | Agent Substrate Concept | Production (Kubernetes + gVisor) | Local (`ate-local` + Apple Container) |
 |---|---|---|
 | **Control Plane** | `ate-api-server` + Redis | `ate-local` in-memory daemon |
-| **Worker Pool** | Pre-warmed Pods running `ateom-gvisor` | Ephemeral or pooled Apple containers |
+| **Worker Pool** | Pre-warmed Pods running `ateworker-gvisor` | Ephemeral or pooled Apple containers |
 | **Actor Creation** | Record in Redis | In-memory record + template mapping |
 | **Actor Resume** | Hydrate snapshot into worker pod, return Pod IP | Start/run Apple container, return `192.168.64.x` IP |
 | **Actor Suspend** | Process checkpoint to GCS snapshot | `container stop`, freeing CPU and RAM |
@@ -31,11 +31,11 @@ Agent Substrate is designed for high-density, multi-tenant agent execution on Ku
 ## API RPCs Implemented
 
 - `CreateAtespace` / `GetAtespace` / `ListAtespaces` / `DeleteAtespace`: Manages namespaces for actors.
-- `CreateActorTemplate` / `GetActorTemplate` / `ListActorTemplates` / `DeleteActorTemplate`: Manages container templates (`image`, `command`, `env`, `readyz` port).
+- `CreateActorTemplate` / `GetActorTemplate` / `ListActorTemplates` / `DeleteActorTemplate`: Manages container templates (`image`, `command`, `env`, `wakeup_probe` port, `resources`).
 - `CreateActor`: Registers an actor bound to an `ActorTemplate`.
-- `ResumeActor`: Starts/runs the Apple container (`container run -d ...`), inspects the `vmnet` interface, and returns the container IP in `Status.WorkerAssignment.WorkerPodIp`.
+- `ResumeActor`: Starts/runs the Apple container (`container run -d ...`), inspects the `vmnet` interface, and returns the container IP in `Status.WorkerAssignment.WorkerPodIps`.
 - `SuspendActor`: Stops the container (`container stop --time 2`), sets state to `ACTOR_STATE_SUSPENDED`.
-- `PauseActor`: Stops the container, sets state to `ACTOR_STATE_PAUSED`.
+- `RevertActor`: Stops the container and reverts state to `ACTOR_STATE_SUSPENDED`.
 - `DeleteActor`: Forces deletion of the container (`container delete --force`).
 - `GetActor` / `ListActors`: Returns actor metadata, state, and worker IP assignment.
 - `CreateActorEgressPolicy` / `GetActorEgressPolicy` / `UpdateActorEgressPolicy` / `DeleteActorEgressPolicy`: Records per-actor egress allowlists for `TaskReconciler`.
@@ -45,12 +45,12 @@ Agent Substrate is designed for high-density, multi-tenant agent execution on Ku
 
 ## Quickstart: the full AX stack on your Mac
 
-`ate-local` replaces Substrate, but AX has two more pieces. The whole local stack is:
+`ate-local` replaces Substrate, and AX stores its resources in PostgreSQL. The whole local stack is:
 
 ```
 ax CLI ──gRPC──> ax-server ──Control gRPC──> ate-local ──> Apple container
                     │
-                    └──> Valkey (locks, resource store, pubsub)
+                    └──> PostgreSQL (resource store, locks)
 ```
 
 `examples/ate_local/local-stack.sh` starts all of it in the right order:
@@ -70,52 +70,52 @@ make local-down
 
 | Command | What it does |
 |---|---|
-| `local-stack.sh up` | Checks prerequisites and ports, builds the binaries (plus a `linux/arm64` `ax-task-runner`), then starts Valkey, `ate-local` and `ax-server`, waiting for each to accept connections before starting the next. Safe to run again. |
-| `local-stack.sh down [--keep-valkey]` | Stops only the processes it started, in reverse order, and removes the Valkey container. |
+| `local-stack.sh up` | Checks prerequisites and ports, builds the binaries (plus a `linux/arm64` `ax-task-runner`), then starts PostgreSQL, `ate-local` and `ax-server`, waiting for each to accept connections before starting the next. Safe to run again. |
+| `local-stack.sh down [--keep-postgres]` | Stops only the processes it started, in reverse order, and removes the PostgreSQL container. |
 | `local-stack.sh status` | Shows each component, its PID and port, and any `ate-*` actor containers. |
-| `local-stack.sh logs [component]` | Follows `.ax-local/logs/*.log`, or `container logs` for `valkey`. |
+| `local-stack.sh logs [component]` | Follows `.ax-local/logs/*.log`, or `container logs` for `postgres`. |
 | `local-stack.sh reset` | `down`, removes leftover actor containers, then `up`. |
 
-Ports default to Valkey `6379`, `ate-local` `50051` and `ax-server` `8090`. Override them with `AX_LOCAL_REDIS_PORT`, `AX_LOCAL_SUBSTRATE_PORT` and `AX_LOCAL_SERVER_PORT`. State (binaries, logs, PID files, generated config) goes in `.ax-local/`, or `AX_LOCAL_DIR`.
+Ports default to PostgreSQL `5432`, `ate-local` `50051` and `ax-server` `8090`. Override them with `AX_LOCAL_POSTGRES_PORT`, `AX_LOCAL_SUBSTRATE_PORT` and `AX_LOCAL_SERVER_PORT`. State (binaries, logs, PID files, generated config) goes in `.ax-local/`, or `AX_LOCAL_DIR`.
 
-### What AX needs from Redis
+### What AX needs from PostgreSQL and `ate-local`
 
-`ax-server` coordinates with Substrate directly under distributed locks. `ate-local`, the `ax` CLI and task containers never connect to Redis. AX uses Redis (Valkey) for:
+`ax-server` coordinates with Substrate directly under distributed locks. `ate-local`, the `ax` CLI and task containers never connect to PostgreSQL. AX uses PostgreSQL and `ate-local` for:
 
-- **Task storage:** Tasks, Models and Workspaces as protojson values (`SET`, `GET`, `MGET`, `DEL` in `MULTI/EXEC`).
-- **Distributed locks:** per-resource distributed locks (`lock:task:*`, `lock:workspace:*`, `lock:model:*`) with automatic lease renewal to serialize operations safely.
-- **Live status:** `ax watch` subscribes to a per-task channel (`PUBLISH`, `SUBSCRIBE`).
+- **Resource storage (PostgreSQL):** Tasks, Models and Workspaces as protojson JSONB documents (`internal/store/postgres`, tables created automatically on startup).
+- **Distributed locks (PostgreSQL):** per-resource lease locks (`locks` table) with automatic lease renewal to serialize operations safely.
+- **Live actor status (`ate-local`):** `ax-server` reads the live actor state and worker IP from `ate-local` (`GetActor` / `ListActors`) on every `GetTask` and `ListTasks`.
 
-Any Redis-protocol server at version 5.0 or later works. The local stack uses Valkey (BSD licensed, also used by Substrate) running in Apple `container`, so no host install is needed.
+The local stack runs `postgres:17-alpine` in Apple `container`, so no host PostgreSQL installation is needed.
 
 ### Why start order matters
 
-If `ax-server` starts before `ate-local`, its gRPC connection goes into reconnect backoff. `local-stack.sh` avoids this by waiting for Valkey and `ate-local` ports before starting `ax-server`.
+If `ax-server` starts before `ate-local` or PostgreSQL, its connections fail or enter reconnect backoff. `local-stack.sh` avoids this by waiting for PostgreSQL (`pg_isready`) and `ate-local` ports before starting `ax-server`.
 
 ### Running the components by hand
 
 ```bash
-container run -d --name ax-valkey -p 127.0.0.1:6379:6379 valkey/valkey:8-alpine
+container run -d --name ax-postgres -e POSTGRES_USER=ax -e POSTGRES_PASSWORD=ax -e POSTGRES_DB=ax -p 127.0.0.1:5432:5432 postgres:17-alpine
 ./bin/ate-local --config examples/ate_local/ate-local.yaml
-./bin/ax-server --addr 127.0.0.1:8090 --redis-addr 127.0.0.1:6379 \
+./bin/ax-server --addr 127.0.0.1:8090 --store "postgres://ax:ax@127.0.0.1:5432/ax?sslmode=disable" \
   --substrate-endpoint 127.0.0.1:50051 --substrate-plaintext \
   --template default --template-atespace default
 ./bin/ax --server localhost:8090 get tasks
 ```
 
-Use `127.0.0.1` rather than `localhost` for Redis: `localhost` can resolve to IPv6 `[::1]`, which the published container port does not listen on.
+Use `127.0.0.1` rather than `localhost` for PostgreSQL: `localhost` can resolve to IPv6 `[::1]`, which the published container port does not listen on.
 
 ### Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
-| `redis: ... dial tcp [::1]:6379: connect: connection refused` | Valkey isn't running, or `localhost` resolved to IPv6. Start Valkey and use `--redis-addr 127.0.0.1:6379`. |
+| `opening store ... dial tcp [::1]:5432: connect: connection refused` | PostgreSQL isn't running, or `localhost` resolved to IPv6. Start PostgreSQL and use `127.0.0.1:5432`. |
 | `http2: frame too large, note that the frame header looked like an HTTP/1.1 header` | `ax` reached a non-gRPC server. Without `--server` or `AX_SERVER`, `ax` connects to `localhost:8080`, which is often used by other tools. Run `source .ax-local/env`. |
 | Task `Pending` with `SubstrateUnavailable` | `ate-local` wasn't running or was temporarily unreachable when `ax-server` reconciled. Start `ate-local`; `ax-server` retries transient errors with backoff. |
 | Task never becomes `Running` | Tasks start `Suspended`; run `ax resume <name>`. |
 | Actor container fails to start with the upstream `ax-task-runner` image | That image is `linux/amd64`. Use `examples/ate_local/task-local.yaml`, which runs `debian:12` with the arm64 runner that `local-stack.sh` mounts in. |
 
-Valkey and `ate-local` both keep state in memory. Restart them together (`local-stack.sh reset`) to keep tasks and actors consistent.
+PostgreSQL (in an ephemeral container) and `ate-local` both keep state for the current session. Restart them together (`local-stack.sh reset`) to keep tasks and actors consistent.
 
 ---
 
