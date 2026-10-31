@@ -55,6 +55,9 @@ type ServerOptions struct {
 	// MetadataPort is the loopback port for the /metadata endpoints. Zero picks
 	// a free port; read the result from MetadataURL after Start.
 	MetadataPort int
+	// Handler, when set, serves HTTP requests on the probe listener other than
+	// /healthz, /readyz, and the guest gRPC services.
+	Handler http.Handler
 }
 
 // NewServer creates a new metadata and guest server serving the task and its
@@ -98,6 +101,9 @@ func NewServer(port int, task *v1alpha1.Task, ws *v1alpha1.Workspace, opts ...Se
 	probeMux := http.NewServeMux()
 	probeMux.HandleFunc("/healthz", s.handleHealthz)
 	probeMux.HandleFunc("/readyz", s.handleReadyz)
+	if opt.Handler != nil {
+		probeMux.Handle("/", opt.Handler)
+	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.grpcServer != nil && r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {

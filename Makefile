@@ -35,10 +35,14 @@ CLAUDE_CODE_REPO ?= gcr.io/ax-images/ax-images
 CLAUDE_CODE_VERSION ?= latest
 CLAUDE_CODE_BASE_IMAGE ?=
 
+# Task image with genkit-runner; see Dockerfile.genkit.
+GENKIT_REPO ?= gcr.io/ax-images/genkit-runner
+GENKIT_BASE_IMAGE ?=
+
 # Prefer podman, fall back to docker.
 CONTAINER_CLI ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 
-.PHONY: build install images check-image-repo build-claude-code-image push-claude-code-image deploy deploy-server deploy-postgres apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean
+.PHONY: build install images check-image-repo build-claude-code-image push-claude-code-image build-genkit-image push-genkit-image deploy deploy-server deploy-postgres apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean
 
 ## --------------------------------------
 ## Build Targets
@@ -113,6 +117,20 @@ push-claude-code-image: build-claude-code-image
 	@mkdir -p bin
 	$(call push_image,$(CLAUDE_CODE_REPO):latest,claude-code)
 	@echo "==> Pushed digest: $(CLAUDE_CODE_REPO)@$$(cat bin/claude-code.digest)"
+
+# Build a task image with genkit-runner as its runner, on top of the default runner image
+build-genkit-image:
+	@echo "==> Cross-compiling genkit-runner for linux/$(IMAGE_ARCH)..."
+	@mkdir -p bin/linux_$(IMAGE_ARCH)
+	GOOS=linux GOARCH=$(IMAGE_ARCH) CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/linux_$(IMAGE_ARCH)/genkit-runner ./cmd/runners/genkit-runner
+	@echo "==> Building container image $(GENKIT_REPO):latest using $(CONTAINER_CLI)..."
+	$(CONTAINER_CLI) build --platform linux/$(IMAGE_ARCH) --build-arg TARGETARCH=$(IMAGE_ARCH) $(if $(GENKIT_BASE_IMAGE),--build-arg BASE_IMAGE=$(GENKIT_BASE_IMAGE),) -t $(GENKIT_REPO):latest -f Dockerfile.genkit .
+
+# Push the Genkit task image to the registry and print the digest to pin in spec.image
+push-genkit-image: build-genkit-image
+	@mkdir -p bin
+	$(call push_image,$(GENKIT_REPO):latest,genkit-runner)
+	@echo "==> Pushed digest: $(GENKIT_REPO)@$$(cat bin/genkit-runner.digest)"
 
 ## --------------------------------------
 ## Deployment Targets

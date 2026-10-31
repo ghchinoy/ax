@@ -95,7 +95,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	if ws != nil && ws.Spec != nil {
 		writeFiles(ws.Spec.Files, targetPath)
 		res.ClonedRepos, gitOK = cloneRepos(ctx, ws.Spec.Git, targetPath)
-		res.SkillsMounted = setupSkills(ws.Spec.Skills)
+		res.SkillsMounted = setupSkills(ws.Spec.Skills, targetPath)
 	}
 
 	if !gitOK {
@@ -240,14 +240,18 @@ func retry(ctx context.Context, attempts int, delay time.Duration, op func() ([]
 }
 
 // setupSkills creates the skills directory if one is declared and returns its path.
-func setupSkills(skills *v1alpha1.SkillsConfig) string {
+func setupSkills(skills *v1alpha1.SkillsConfig, targetPath string) string {
 	if skills == nil || skills.Path == "" {
 		return ""
 	}
-	if err := os.MkdirAll(skills.Path, dirPerm); err != nil {
-		slog.Warn("creating skills dir", "path", skills.Path, "error", err)
+	p := skills.Path
+	if !filepath.IsAbs(p) && targetPath != "" {
+		p = filepath.Join(targetPath, p)
 	}
-	return skills.Path
+	if err := os.MkdirAll(p, dirPerm); err != nil {
+		slog.Warn("creating skills dir", "path", p, "error", err)
+	}
+	return p
 }
 
 // MarkerName returns the maiden-run marker file name for a workspace mounted at

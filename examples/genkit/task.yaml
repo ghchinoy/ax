@@ -1,0 +1,92 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A Task that serves a Genkit Go agent configured from spec.config over A2A
+# and Genkit's native HTTP agent routes.
+#
+# Before applying:
+#
+# 1. Build and push the image, then pin its digest in spec.image below.
+#    Substrate rejects tag-only image references.
+#
+#      make push-genkit-image GENKIT_REPO=<your-registry>/<image>
+#
+# 2. Provide GEMINI_API_KEY via spec.env at apply time:
+#
+#      GEMINI_API_KEY=AIzaSy... envsubst < examples/genkit/task.yaml | ax apply -f -
+#
+# 3. Talk to the agent through the atenet router:
+#
+#      kubectl -n ate-system port-forward svc/atenet-router 8001:80
+#      curl -H "ate-target-actor: default/genkit-triage" -H "Content-Type: application/json" \
+#        http://localhost:8001/ -d '{
+#          "jsonrpc": "2.0", "id": 1, "method": "message/send",
+#          "params": {"message": {"role": "user", "messageId": "m1", "contextId": "ctx-1",
+#            "parts": [{"kind": "text", "text": "Triage the repository and write a summary to /workspace/genkit-output.md."}]}}
+#        }'
+apiVersion: ax.io/v1alpha1
+kind: Workspace
+metadata:
+  name: itsdangerous-genkit
+  atespace: default
+spec:
+  git:
+    - name: origin
+      repo: "https://github.com/pallets/itsdangerous.git"
+      branch: "main"
+  files:
+    - path: "AGENTS.md"
+      content: |
+        # Working in this repo
+        - Inspect the source files under src/itsdangerous and tests/.
+        - Keep changes small and focused; do not add runtime dependencies.
+  skills:
+    path: ".agents/skills"
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: genkit-triage
+  atespace: default
+spec:
+  # Built from Dockerfile.genkit; replace the digest with the one
+  # `make push-genkit-image` prints.
+  image: "gcr.io/ax-images/genkit-runner@sha256:REPLACE_WITH_PUSHED_DIGEST"
+  config:
+    name: triage_agent
+    description: Triages failing tests and summarizes repository structure.
+    model: googleai/gemini-3.8-flash
+    instruction: |
+      You are a careful engineer. Use the filesystem tools to inspect the
+      repository in /workspace before answering. Write reports to
+      /workspace/genkit-output.md when asked.
+    config:
+      maxOutputTokens: 8192
+    maxTurns: 15
+    use:
+      - name: genkit-middleware/filesystem
+        config:
+          rootDirectory: /workspace
+          allowWriteAccess: true
+      - name: genkit-middleware/skills
+  env:
+    - name: GEMINI_API_KEY
+      value: "${GEMINI_API_KEY}"
+  resources:
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  workspace:
+    name: itsdangerous-genkit
+  debug: true

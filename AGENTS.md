@@ -21,6 +21,7 @@ reconciler or server.
 cmd/ax                 CLI (apply/get/describe/ssh/suspend/resume/delete/ctx/tunnel)
 cmd/ax-server          Control plane: gRPC API; provisions, suspends, resumes and deletes task actors directly
 cmd/ax-task-runner     PID 1 inside the sandbox; materializes the Workspace, runs the agent
+cmd/runners/           Specialized runners (claude-code-runner, genkit-runner) configured from Task.spec.config
 internal/controller    TaskReconciler: Substrate side of task suspend/resume/delete; reconciler_test.go is the test template
 internal/server        gRPC handlers
 internal/store/        memory + postgres backends (schema.sql and schema.go change together)
@@ -40,7 +41,7 @@ skills/                Developer skills (SKILL.md format). .agents/skills, .clau
 export GOTOOLCHAIN=auto          # go.mod wants 1.27.1; older local Go auto-downloads it
 go mod tidy && git diff --exit-code go.mod go.sum
 go build ./cmd/ax ./cmd/ax-server ./cmd/ax-task-runner
-go test ./...                    # ~20 s, 16 packages with tests; Postgres + E2E tiers self-skip
+go test ./...                    # ~20 s, 17 packages with tests; Postgres + E2E tiers self-skip
 go vet ./... && gofmt -l .       # not run by CI; both are clean at HEAD
 ```
 

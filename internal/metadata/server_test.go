@@ -246,3 +246,45 @@ func TestMetadataServer_MetadataOnlyOnLoopback(t *testing.T) {
 		t.Log("no non-loopback IPv4 address found; skipped the external address check")
 	}
 }
+
+func TestMetadataServer_CustomHandler(t *testing.T) {
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "custom-handler", Atespace: "default"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/test/img"},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /agents/echo", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("echo-ok"))
+	})
+
+	srv := metadata.NewServer(0, task, nil, metadata.ServerOptions{
+		Handler: mux,
+	})
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Stop(context.Background())
+
+	// /healthz still works alongside the custom handler.
+	resp, err := http.Get("http://" + srv.ProbeAddr() + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz = %d, want 200", resp.StatusCode)
+	}
+
+	// Custom handler serves /agents/echo on the probe port.
+	resp, err = http.Post("http://"+srv.ProbeAddr()+"/agents/echo", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("custom route request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "echo-ok" {
+		t.Errorf("POST /agents/echo = %d %q, want 200 \"echo-ok\"", resp.StatusCode, body)
+	}
+}
