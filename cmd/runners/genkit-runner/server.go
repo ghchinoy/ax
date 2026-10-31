@@ -82,20 +82,9 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 		return nil, nil, fmt.Errorf("creating prompt directory: %w", err)
 	}
 
-	// Write the initial prompt file before genkit.Init so the prompt registry
-	// discovers it; if MCP servers advertise tools we rewrite and reload before
-	// defining the agent.
-	if err := spec.writePromptFile(promptDir, wsPath, nil); err != nil {
-		return nil, nil, err
-	}
-
 	plugins := defaultPlugins(spec.Model)
 	plugins = append(plugins, extraPlugins...)
 
-	// Connect MCP servers first (if any) using a bootstrap Genkit instance or
-	// after Init. Because DefinePromptAgent renders the prompt at definition
-	// time, we initialize Genkit with the prompt directory after writing any
-	// discovered MCP tool names into the prompt frontmatter.
 	var mcpCleanup func()
 	var mcpClients []*mcp.GenkitMCPClient
 	for _, srv := range spec.MCPServers {
@@ -114,11 +103,12 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 
 	g := genkit.Init(ctx,
 		genkit.WithExperimental(),
-		genkit.WithPromptDir(promptDir),
 		genkit.WithPlugins(plugins...),
 	)
 
-	// Register active tools from any connected MCP servers on g.
+	// Register active tools from any connected MCP servers on g before writing
+	// and loading the prompt file so discovered MCP tools are included in
+	// frontmatter with a single genkit.Init call.
 	var mcpToolNames []string
 	for _, c := range mcpClients {
 		tools, err := c.GetActiveTools(ctx, g)
@@ -127,26 +117,18 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 			continue
 		}
 		for _, t := range tools {
+			if reg, ok := t.(api.Registerable); ok {
+				genkit.RegisterAction(g, reg)
+			}
 			mcpToolNames = append(mcpToolNames, t.Name())
 		}
 	}
-	// If MCP servers provided tools and we generated the prompt from
-	// spec.config, re-register the prompt with those tools attached.
-	if len(mcpToolNames) > 0 && spec.PromptFile == "" {
-		if err := spec.writePromptFile(promptDir, wsPath, mcpToolNames); err != nil {
-			mcpCleanup()
-			return nil, nil, err
-		}
-		// Re-initialize with the updated prompt file so the prompt includes MCP tools.
-		g = genkit.Init(ctx,
-			genkit.WithExperimental(),
-			genkit.WithPromptDir(promptDir),
-			genkit.WithPlugins(plugins...),
-		)
-		for _, c := range mcpClients {
-			_, _ = c.GetActiveTools(ctx, g)
-		}
+
+	if err := spec.writePromptFile(promptDir, wsPath, mcpToolNames); err != nil {
+		mcpCleanup()
+		return nil, nil, err
 	}
+	genkit.LoadPromptDir(g, promptDir, "")
 
 	storeDir := filepath.Join(wsPath, ".genkit", "snapshots")
 	store, err := localstore.NewFileSessionStore[any](storeDir)
