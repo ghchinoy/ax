@@ -199,7 +199,7 @@ func defaultPlugins(modelName string) []api.Plugin {
 	case strings.HasPrefix(modelName, "vertexai/"):
 		plugins = append(plugins, &googlegenai.VertexAI{
 			ProjectID: firstNonEmpty(os.Getenv("GOOGLE_CLOUD_PROJECT"), os.Getenv("GCLOUD_PROJECT")),
-			Location:  firstNonEmpty(os.Getenv("GOOGLE_CLOUD_LOCATION"), "us-central1"),
+			Location:  firstNonEmpty(os.Getenv("GOOGLE_CLOUD_LOCATION"), "global"),
 		})
 	case strings.HasPrefix(modelName, "anthropic/"):
 		if os.Getenv("ANTHROPIC_API_KEY") != "" || os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" {
@@ -248,13 +248,11 @@ func (e *genkitA2AExecutor) Execute(ctx context.Context, execCtx *a2asrv.Executo
 
 		out, err := e.agent.RunText(ctx, prompt, opts...)
 		if err != nil {
-			msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, execCtx, a2a.NewTextPart(err.Error()))
-			yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateFailed, msg), nil)
+			yield(nil, err)
 			return
 		}
 		if out.FinishReason == aix.AgentFinishReasonFailed && out.Error != nil {
-			msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, execCtx, a2a.NewTextPart(out.Error.Message))
-			yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateFailed, msg), nil)
+			yield(nil, fmt.Errorf("agent turn failed (%s): %s", out.Error.Status, out.Error.Message))
 			return
 		}
 
