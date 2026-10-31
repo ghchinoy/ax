@@ -135,7 +135,7 @@ func main() {
 
 Cross-compile it for `linux/amd64` with `CGO_ENABLED=0` and copy it into your image at `/usr/local/bin/ax-task-runner`.
 
-For a working example, see [`cmd/runners/claude-code-runner`](../cmd/runners/claude-code-runner), which builds a Claude Code invocation from `spec.config` and passes it to `runner.Run` as the command. [Claude Code runner](../examples/claude-code/README.md) documents it.
+For a working example, see [`cmd/runners/claude-code-runner`](../cmd/runners/claude-code-runner), which builds a Claude Code invocation from `spec.config` and passes it to `runner.Run` as the command ([Claude Code runner](../examples/claude-code/README.md)), or [`cmd/runners/genkit-runner`](../cmd/runners/genkit-runner), which mounts an in-process Genkit Go and A2A HTTP handler on `runner.Config.Handler` ([Genkit Go runner](../examples/genkit/README.md)).
 
 ### 3. Write a runner from scratch
 

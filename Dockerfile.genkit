@@ -1,0 +1,37 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Task image with genkit-runner installed as /usr/local/bin/ax-task-runner.
+#
+# Extends the default ax-task-runner image and replaces its runner with
+# genkit-runner (cmd/runners/genkit-runner). A Task that leaves spec.command
+# empty is configured through spec.config using Genkit's Dotprompt frontmatter
+# schema (model, config, maxTurns, tools, use) plus instruction, and served
+# over both A2A JSON-RPC (/) and Genkit's native HTTP agent routes
+# (/agents/<name>...). A Task that sets spec.command runs it as usual.
+#
+#   make build-genkit-image            # build locally
+#   make push-genkit-image             # push and print the digest
+#
+# Pin the digest the Makefile prints in your Task's spec.image. See
+# examples/genkit/task.yaml for a Task that uses this image.
+
+ARG BASE_IMAGE=gcr.io/ax-substrate/ate-images/ax-task-runner@sha256:3a0dea6ad8b55278685db58aca6e37dc4ba04056831d45bef3aaeafdca43cac6
+FROM ${BASE_IMAGE}
+
+# The Makefile cross-compiles the runner into bin/ before building the image.
+ARG TARGETARCH=amd64
+COPY bin/linux_${TARGETARCH}/genkit-runner /usr/local/bin/ax-task-runner
+
+ENTRYPOINT ["/usr/local/bin/ax-task-runner"]

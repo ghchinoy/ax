@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"syscall"
@@ -66,6 +67,13 @@ type Config struct {
 	// Workspace is the Workspace resource the task's spec.workspace refers to.
 	// Nil sets up an empty working directory instead.
 	Workspace *v1alpha1.Workspace
+	// Handler, when set, is mounted on the probe listener to serve HTTP requests
+	// other than /healthz, /readyz, and the guest gRPC services.
+	Handler http.Handler
+	// OnWorkspaceReady, when set, is called after workspace maiden-run setup
+	// succeeds and before /readyz begins returning 200. If it returns an error,
+	// /readyz remains 503 and Run returns the error.
+	OnWorkspaceReady func(ctx context.Context, wsPath string) error
 	// OnCommandExit, when set, is called once the task command has exited.
 	OnCommandExit func(CommandExit)
 }
@@ -109,6 +117,7 @@ func Run(ctx context.Context, cfg Config) error {
 	metaServer := metadata.NewServer(port, cfg.Task, cfg.Workspace, metadata.ServerOptions{
 		WorkspacePath: wsPath,
 		MetadataPort:  metadataPort,
+		Handler:       cfg.Handler,
 	})
 	if err := metaServer.Start(); err != nil {
 		return fmt.Errorf("starting metadata server: %w", err)
@@ -126,6 +135,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if _, err := workspace.SetupWorkspace(ctx, cfg.Workspace, wsPath); err != nil {
 		slog.Error("workspace maiden run setup failed", "workspace", ref.GetName(), "path", wsPath, "error", err)
 	} else {
+		if cfg.OnWorkspaceReady != nil {
+			if err := cfg.OnWorkspaceReady(ctx, wsPath); err != nil {
+				return fmt.Errorf("workspace ready hook: %w", err)
+			}
+		}
 		metaServer.SetWorkspaceReady(true)
 		slog.Info("workspace maiden run setup marked ready", "path", wsPath)
 	}

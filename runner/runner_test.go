@@ -294,3 +294,43 @@ func TestRun_SetsUpBoundWorkspace(t *testing.T) {
 		t.Errorf("workspace endpoint should serve the bound workspace:\n%s", body)
 	}
 }
+
+func TestRun_HandlerAndOnWorkspaceReady(t *testing.T) {
+	h := newHarness(t)
+	var readyPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /agent-status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, readyPath)
+	})
+	h.cfg.Handler = mux
+	h.cfg.OnWorkspaceReady = func(ctx context.Context, wsPath string) error {
+		readyPath = wsPath
+		return nil
+	}
+
+	h.start(t)
+	waitHealthy(t, h.cfg.Port)
+
+	// Wait for /readyz to turn 200 after OnWorkspaceReady runs.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/readyz", h.cfg.Port))
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/agent-status", h.cfg.Port))
+	if err != nil {
+		t.Fatalf("GET /agent-status: %v", err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != h.wsPath {
+		t.Errorf("GET /agent-status = %q, want %q", got, h.wsPath)
+	}
+}
