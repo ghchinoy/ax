@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ActorRecord holds state for a managed actor in the local Control plane.
@@ -43,6 +44,7 @@ type ActorRecord struct {
 	Port              int
 	State             ateapipb.ActorState
 	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 func (r *ActorRecord) toProto() *ateapipb.Actor {
@@ -56,10 +58,21 @@ func (r *ActorRecord) toProto() *ateapipb.Actor {
 			WorkerPodIps: []string{r.ContainerIP},
 		}
 	}
+	var createTime, updateTime *timestamppb.Timestamp
+	if !r.CreatedAt.IsZero() {
+		createTime = timestamppb.New(r.CreatedAt)
+	}
+	if !r.UpdatedAt.IsZero() {
+		updateTime = timestamppb.New(r.UpdatedAt)
+	} else if createTime != nil {
+		updateTime = createTime
+	}
 	return &ateapipb.Actor{
 		Metadata: &ateapipb.ResourceMetadata{
-			Atespace: r.Atespace,
-			Name:     r.Name,
+			Atespace:   r.Atespace,
+			Name:       r.Name,
+			CreateTime: createTime,
+			UpdateTime: updateTime,
 		},
 		ActorTemplate: &ateapipb.ObjectRef{
 			Atespace: r.TemplateNamespace,
@@ -422,6 +435,7 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 		containerName = fmt.Sprintf("%s-%x", strings.TrimRight(containerName[:41], "-._"), sum[:3])
 	}
 
+	now := time.Now()
 	record := &ActorRecord{
 		Atespace:          atespace,
 		Name:              name,
@@ -430,7 +444,8 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 		ContainerName:     containerName,
 		Port:              port,
 		State:             ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-		CreatedAt:         time.Now(),
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 
 	s.actors[key] = record
@@ -562,6 +577,7 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 	s.mu.Lock()
 	actor.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
 	actor.ContainerIP = ip
+	actor.UpdatedAt = time.Now()
 	s.mu.Unlock()
 
 	return &ateapipb.ResumeActorResponse{
@@ -610,6 +626,7 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 	s.mu.Lock()
 	actor.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 	actor.ContainerIP = ""
+	actor.UpdatedAt = time.Now()
 	s.mu.Unlock()
 
 	return &ateapipb.SuspendActorResponse{}, nil
@@ -637,6 +654,7 @@ func (s *Server) RevertActor(ctx context.Context, req *ateapipb.RevertActorReque
 	s.mu.Lock()
 	actor.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 	actor.ContainerIP = ""
+	actor.UpdatedAt = time.Now()
 	s.mu.Unlock()
 
 	return &ateapipb.RevertActorResponse{
