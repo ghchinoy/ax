@@ -161,6 +161,9 @@ func TestControlServer_ActorLifecycle(t *testing.T) {
 	if got := createResp.GetMetadata().GetName(); got != actorName {
 		t.Errorf("CreateActor(%q).Metadata.Name = %q, want %q", actorName, got, actorName)
 	}
+	if createResp.GetMetadata().GetCreateTime() == nil || createResp.GetMetadata().GetUpdateTime() == nil {
+		t.Errorf("CreateActor(%q).Metadata timestamps missing: create=%v update=%v", actorName, createResp.GetMetadata().GetCreateTime(), createResp.GetMetadata().GetUpdateTime())
+	}
 	if got := createResp.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
 		t.Errorf("CreateActor(%q).Status.State = %v, want %v", actorName, got, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
 	}
