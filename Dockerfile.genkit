@@ -18,8 +18,9 @@
 # genkit-runner (cmd/runners/genkit-runner). A Task that leaves spec.command
 # empty is configured through spec.config using Genkit's Dotprompt frontmatter
 # schema (model, config, maxTurns, tools, use) plus instruction, and served
-# over both A2A JSON-RPC (/) and Genkit's native HTTP agent routes
-# (/agents/<name>...). A Task that sets spec.command runs it as usual.
+# over A2A gRPC (lf.a2a.v1.A2AService / a2a.v1.A2AService), A2A JSON-RPC (/),
+# and Genkit's native HTTP agent routes (/agents/<name>...). A Task that sets
+# spec.command runs it as usual.
 #
 #   make build-genkit-image            # build locally
 #   make push-genkit-image             # push and print the digest

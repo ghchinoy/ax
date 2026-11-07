@@ -28,10 +28,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aclient"
+	a2agrpcv1 "github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
 	"github.com/firebase/genkit/go/ai"
 	"github.com/google/ax/internal/workspace"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"github.com/google/ax/runner"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -151,6 +156,7 @@ func TestGenkitRunner_EndToEndWithSuspendResumeAndFilesystem(t *testing.T) {
 	task := &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "genkit-triage", Atespace: "default"},
 		Spec: &v1alpha1.TaskSpec{
+			Debug:     true,
 			Workspace: &v1alpha1.WorkspaceRef{Name: "repo-ws", Path: wsPath},
 			Config: mustStruct(t, map[string]any{
 				"name":        "triage_agent",
@@ -320,6 +326,38 @@ func TestGenkitRunner_EndToEndWithSuspendResumeAndFilesystem(t *testing.T) {
 	raw3, _ := json.Marshal(genkitBody)
 	if !strings.Contains(string(raw3), "turn=3 history=Triage the failing tests.|Write the summary.|Done? tools=4") {
 		t.Fatalf("unexpected Genkit native HTTP response: %s", raw3)
+	}
+
+	// 5. Send turn 4 via A2A gRPC transport on the same probe port alongside guest gRPC!
+	grpcClient, err := a2aclient.NewFromEndpoints(ctx2, []*a2a.AgentInterface{
+		a2a.NewAgentInterface(fmt.Sprintf("127.0.0.1:%d", port2), a2a.TransportProtocolGRPC),
+	}, a2agrpcv1.WithGRPCTransport(grpc.WithTransportCredentials(insecure.NewCredentials())))
+	if err != nil {
+		t.Fatalf("creating A2A gRPC client failed: %v", err)
+	}
+	defer grpcClient.Destroy()
+
+	extCard, err := grpcClient.GetExtendedAgentCard(ctx2, &a2a.GetExtendedAgentCardRequest{})
+	if err != nil {
+		t.Fatalf("A2A gRPC GetExtendedAgentCard failed: %v", err)
+	}
+	if extCard.Name != "triage_agent" {
+		t.Fatalf("GetExtendedAgentCard.Name = %q, want triage_agent", extCard.Name)
+	}
+
+	grpcMsg := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("Confirm over gRPC."))
+	grpcMsg.ContextID = "ctx-triage"
+	grpcRes, err := grpcClient.SendMessage(ctx2, &a2a.SendMessageRequest{Message: grpcMsg})
+	if err != nil {
+		t.Fatalf("A2A gRPC SendMessage (turn 4) failed: %v", err)
+	}
+	replyMsg, ok := grpcRes.(*a2a.Message)
+	if !ok || replyMsg == nil || len(replyMsg.Parts) == 0 {
+		t.Fatalf("unexpected A2A gRPC SendMessage result: %#v", grpcRes)
+	}
+	replyText, _ := replyMsg.Parts[0].Content.(a2a.Text)
+	if !strings.Contains(string(replyText), "turn=4 history=Triage the failing tests.|Write the summary.|Done?|Confirm over gRPC. tools=4") {
+		t.Fatalf("unexpected A2A gRPC reply text: %q", replyText)
 	}
 
 	cancel2()

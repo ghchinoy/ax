@@ -106,7 +106,7 @@ func NewServer(port int, task *v1alpha1.Task, ws *v1alpha1.Workspace, opts ...Se
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.grpcServer != nil && r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+		if s.grpcServer != nil && r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") && (opt.Handler == nil || s.isGuestService(r.URL.Path)) {
 			s.grpcServer.ServeHTTP(w, r)
 			return
 		}
@@ -217,6 +217,19 @@ func (s *Server) IsWorkspaceReady() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.workspaceReady
+}
+
+func (s *Server) isGuestService(urlPath string) bool {
+	if s.grpcServer == nil {
+		return false
+	}
+	trimmed := strings.TrimPrefix(urlPath, "/")
+	svc, _, ok := strings.Cut(trimmed, "/")
+	if !ok || svc == "" {
+		return false
+	}
+	_, exists := s.grpcServer.GetServiceInfo()[svc]
+	return exists
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

@@ -2,8 +2,9 @@
 
 `genkit-runner` is a [runner](../../docs/runner.md) that serves a [Genkit Go](https://genkit.dev/docs/go/overview/) agent configured declaratively in the `Task` manifest. It embeds the standard `runner` package, so workspace setup, probes, guest services (`ax ssh`), and shutdown work as they do with the default runner.
 
-When a task leaves `spec.command` empty and sets `spec.config`, the runner builds a store-backed Genkit agent from `spec.config` (using Genkit's [Dotprompt](https://genkit.dev/docs/go/dotprompt/) frontmatter schema) and serves it on port 80 over both:
+When a task leaves `spec.command` empty and sets `spec.config`, the runner builds a store-backed Genkit agent from `spec.config` (using Genkit's [Dotprompt](https://genkit.dev/docs/go/dotprompt/) frontmatter schema) and serves it on port 80 over:
 
+- **A2A gRPC**: `lf.a2a.v1.A2AService` (`a2agrpc/v1`) and `a2a.v1.A2AService` (`a2agrpc/v0`) over `h2c` (multiplexed alongside `ate.guest.v1.*` when `spec.debug: true`)
 - **A2A JSON-RPC**: `POST /` and `GET /.well-known/agent-card.json`
 - **Genkit native HTTP agent routes**: `POST /agents/<name>`, `POST /agents/<name>/getSnapshot`, `POST /agents/<name>/waitForSnapshot`, and `POST /agents/<name>/abort`
 

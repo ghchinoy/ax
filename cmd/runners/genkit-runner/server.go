@@ -27,6 +27,8 @@ import (
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2acompat/a2av0"
+	a2agrpcv0 "github.com/a2aproject/a2a-go/v2/a2agrpc/v0"
+	a2agrpcv1 "github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/firebase/genkit/go/ai"
 	aix "github.com/firebase/genkit/go/ai/exp"
@@ -40,6 +42,7 @@ import (
 	"github.com/firebase/genkit/go/plugins/mcp"
 	"github.com/firebase/genkit/go/plugins/middleware"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"google.golang.org/grpc"
 )
 
 // dynamicHandler delegates HTTP requests to the inner handler set once
@@ -68,9 +71,10 @@ func (d *dynamicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // buildAgentHandler initializes Genkit, connects any Workspace MCP servers,
 // materializes the Dotprompt file from spec, defines the store-backed Genkit
-// agent under wsPath/.genkit/snapshots, and mounts both Genkit's native HTTP
-// routes (/agents/<name>...) and the A2A JSON-RPC server (/ and
-// /.well-known/agent-card.json).
+// agent under wsPath/.genkit/snapshots, and mounts Genkit's native HTTP
+// routes (/agents/<name>...), the A2A JSON-RPC server (/ and
+// /.well-known/agent-card.json), and the A2A gRPC server
+// (lf.a2a.v1.A2AService and a2a.v1.A2AService).
 func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Workspace, wsPath string, extraPlugins ...api.Plugin) (http.Handler, func(), error) {
 	spec, err := parseAgentSpec(task.GetSpec().GetConfig(), ws, wsPath)
 	if err != nil {
@@ -149,15 +153,44 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 		mux.HandleFunc(route.Pattern(), route.Handler())
 	}
 
-	a2aHandler := a2asrv.NewHandler(&genkitA2AExecutor{agent: ag})
-	mux.Handle("/", a2av0.NewJSONRPCHandler(a2aHandler))
-	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(&a2a.AgentCard{
+	agentDesc := firstNonEmpty(spec.Description, fmt.Sprintf("Genkit agent %s", spec.Name))
+	agentCard := &a2a.AgentCard{
 		Name:               spec.Name,
-		Description:        firstNonEmpty(spec.Description, fmt.Sprintf("Genkit agent %s", spec.Name)),
+		Description:        agentDesc,
 		Version:            "1.0.0",
 		DefaultInputModes:  []string{"text/plain"},
 		DefaultOutputModes: []string{"text/plain"},
-	}))
+		SupportedInterfaces: []*a2a.AgentInterface{
+			a2a.NewAgentInterface("localhost:80", a2a.TransportProtocolGRPC),
+			a2a.NewAgentInterface("http://localhost:80/", a2a.TransportProtocolJSONRPC),
+		},
+		Capabilities: a2a.AgentCapabilities{
+			Streaming:         true,
+			ExtendedAgentCard: true,
+		},
+		Skills: []a2a.AgentSkill{{
+			ID:          spec.Name,
+			Name:        spec.Name,
+			Description: agentDesc,
+			Tags:        []string{"genkit", "ax"},
+		}},
+	}
+
+	a2aHandler := a2asrv.NewHandler(&genkitA2AExecutor{agent: ag}, a2asrv.WithExtendedAgentCard(agentCard))
+	mux.Handle("/", a2av0.NewJSONRPCHandler(a2aHandler))
+	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(agentCard))
+
+	a2aGRPCServer := grpc.NewServer()
+	a2agrpcv1.NewHandler(a2aHandler).RegisterWith(a2aGRPCServer)
+	a2agrpcv0.NewHandler(a2aHandler).RegisterWith(a2aGRPCServer)
+
+	combined := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			a2aGRPCServer.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 
 	slog.Info("initialized Genkit agent server",
 		"agent", spec.Name,
@@ -165,7 +198,7 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 		"storeDir", storeDir,
 		"mcpTools", len(mcpToolNames),
 	)
-	return mux, mcpCleanup, nil
+	return combined, mcpCleanup, nil
 }
 
 // defaultPlugins returns the built-in middleware plugin plus the model

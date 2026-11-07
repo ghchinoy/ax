@@ -20,6 +20,7 @@
 // When the task leaves spec.command empty and sets spec.config, the runner
 // serves the configured Genkit agent in-process on port 80 alongside /healthz,
 // /readyz, and the optional guest gRPC services:
+//   - A2A gRPC (lf.a2a.v1.A2AService and a2a.v1.A2AService) over h2c
 //   - A2A JSON-RPC at / and /.well-known/agent-card.json
 //   - Genkit native agent HTTP routes at /agents/<name>, /getSnapshot,
 //     /waitForSnapshot, and /abort
