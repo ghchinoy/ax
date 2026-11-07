@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
 	"log/slog"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2acompat/a2av0"
@@ -42,6 +44,8 @@ import (
 	"github.com/firebase/genkit/go/plugins/mcp"
 	"github.com/firebase/genkit/go/plugins/middleware"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
 )
 
@@ -86,6 +90,15 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 		return nil, nil, fmt.Errorf("creating prompt directory: %w", err)
 	}
 
+	tracesPath := filepath.Join(wsPath, ".genkit", "traces.jsonl")
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(&genkitSpanExporter{
+			agentName:  spec.Name,
+			tracesPath: tracesPath,
+		}),
+	)
+	otel.SetTracerProvider(tp)
+
 	plugins := defaultPlugins(spec.Model)
 	plugins = append(plugins, extraPlugins...)
 
@@ -100,6 +113,7 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 		mcpClients = append(mcpClients, client)
 	}
 	mcpCleanup = func() {
+		_ = tp.Shutdown(context.Background())
 		for _, c := range mcpClients {
 			_ = c.Disconnect()
 		}
@@ -176,7 +190,7 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 		}},
 	}
 
-	a2aHandler := a2asrv.NewHandler(&genkitA2AExecutor{agent: ag}, a2asrv.WithExtendedAgentCard(agentCard))
+	a2aHandler := a2asrv.NewHandler(&genkitA2AExecutor{agentName: spec.Name, agent: ag}, a2asrv.WithExtendedAgentCard(agentCard))
 	mux.Handle("/", a2av0.NewJSONRPCHandler(a2aHandler))
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(agentCard))
 
@@ -239,9 +253,107 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// genkitSpanRecord is persisted to /workspace/.genkit/traces.jsonl and logged
+// via slog so Substrate worker logs and AX Central can reconstruct the full
+// Genkit OpenTelemetry span tree for every agent turn, model call, and tool call.
+type genkitSpanRecord struct {
+	Agent         string  `json:"agent"`
+	Span          string  `json:"span"`
+	Type          string  `json:"type,omitempty"`
+	Subtype       string  `json:"subtype,omitempty"`
+	Status        string  `json:"status,omitempty"`
+	TraceID       string  `json:"trace_id"`
+	SpanID        string  `json:"span_id"`
+	ParentSpanID  string  `json:"parent_span_id,omitempty"`
+	StartUnixNano int64   `json:"start_unix_nano"`
+	EndUnixNano   int64   `json:"end_unix_nano"`
+	DurationMs    float64 `json:"duration_ms"`
+}
+
+type genkitSpanExporter struct {
+	mu         sync.Mutex
+	agentName  string
+	tracesPath string
+}
+
+func (e *genkitSpanExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	var f *os.File
+	if e.tracesPath != "" {
+		f, _ = os.OpenFile(e.tracesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if f != nil {
+			defer f.Close()
+		}
+	}
+
+	for _, s := range spans {
+		var spanType, spanSubtype, spanState string
+		for _, attr := range s.Attributes() {
+			switch string(attr.Key) {
+			case "genkit:type":
+				spanType = attr.Value.AsString()
+			case "genkit:subtype":
+				spanSubtype = attr.Value.AsString()
+			case "genkit:state":
+				spanState = attr.Value.AsString()
+			}
+		}
+		if spanState == "" {
+			spanState = "success"
+		}
+		traceID := s.SpanContext().TraceID().String()
+		spanID := s.SpanContext().SpanID().String()
+		parentSpanID := ""
+		if s.Parent().IsValid() {
+			parentSpanID = s.Parent().SpanID().String()
+		}
+		startNano := s.StartTime().UnixNano()
+		endNano := s.EndTime().UnixNano()
+		durMs := float64(endNano-startNano) / 1e6
+
+		rec := genkitSpanRecord{
+			Agent:         e.agentName,
+			Span:          s.Name(),
+			Type:          spanType,
+			Subtype:       spanSubtype,
+			Status:        spanState,
+			TraceID:       traceID,
+			SpanID:        spanID,
+			ParentSpanID:  parentSpanID,
+			StartUnixNano: startNano,
+			EndUnixNano:   endNano,
+			DurationMs:    durMs,
+		}
+		if f != nil {
+			if data, err := json.Marshal(rec); err == nil {
+				_, _ = f.Write(append(data, '\n'))
+			}
+		}
+		slog.Info("genkit otel span",
+			"agent", e.agentName,
+			"span", s.Name(),
+			"type", spanType,
+			"subtype", spanSubtype,
+			"status", spanState,
+			"duration_ms", fmt.Sprintf("%.2f", durMs),
+			"start_unix_nano", startNano,
+			"end_unix_nano", endNano,
+			"trace_id", traceID,
+			"span_id", spanID,
+			"parent_span_id", parentSpanID,
+		)
+	}
+	return nil
+}
+
+func (e *genkitSpanExporter) Shutdown(_ context.Context) error { return nil }
+
 // genkitA2AExecutor adapts a Genkit *aix.Agent[any] to an A2A AgentExecutor.
 type genkitA2AExecutor struct {
-	agent *aix.Agent[any]
+	agentName string
+	agent     *aix.Agent[any]
 }
 
 func (e *genkitA2AExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
@@ -261,13 +373,31 @@ func (e *genkitA2AExecutor) Execute(ctx context.Context, execCtx *a2asrv.Executo
 			opts = append(opts, aix.WithSessionID[any](execCtx.ContextID))
 		}
 
+		started := time.Now()
+		slog.Info("A2A turn started",
+			"agent", e.agentName,
+			"context_id", execCtx.ContextID,
+			"prompt_chars", len(prompt),
+		)
+
 		out, err := e.agent.RunText(ctx, prompt, opts...)
 		if err != nil {
+			slog.Error("A2A turn failed",
+				"agent", e.agentName,
+				"context_id", execCtx.ContextID,
+				"error", err,
+			)
 			yield(nil, err)
 			return
 		}
 		if out.FinishReason == aix.AgentFinishReasonFailed && out.Error != nil {
-			yield(nil, fmt.Errorf("agent turn failed (%s): %s", out.Error.Status, out.Error.Message))
+			err := fmt.Errorf("agent turn failed (%s): %s", out.Error.Status, out.Error.Message)
+			slog.Error("A2A turn failed",
+				"agent", e.agentName,
+				"context_id", execCtx.ContextID,
+				"error", err,
+			)
+			yield(nil, err)
 			return
 		}
 
@@ -281,6 +411,13 @@ func (e *genkitA2AExecutor) Execute(ctx context.Context, execCtx *a2asrv.Executo
 		} else {
 			reply.ContextID = out.SessionID
 		}
+		slog.Info("A2A turn completed",
+			"agent", e.agentName,
+			"context_id", reply.ContextID,
+			"finish_reason", string(out.FinishReason),
+			"duration_ms", fmt.Sprintf("%.2f", float64(time.Since(started).Nanoseconds())/1e6),
+			"reply_chars", len(replyText),
+		)
 		yield(reply, nil)
 	}
 }

@@ -364,6 +364,16 @@ func TestGenkitRunner_EndToEndWithSuspendResumeAndFilesystem(t *testing.T) {
 	if err := <-done2; err != nil {
 		t.Fatalf("Boot 2 exited with error: %v", err)
 	}
+
+	// 6. Verify OpenTelemetry spans were exported to .genkit/traces.jsonl
+	tracesFile := filepath.Join(wsPath, ".genkit", "traces.jsonl")
+	tracesData, err := os.ReadFile(tracesFile)
+	if err != nil {
+		t.Fatalf("reading %s: %v", tracesFile, err)
+	}
+	if !strings.Contains(string(tracesData), `"agent":"triage_agent"`) || !strings.Contains(string(tracesData), `"trace_id":`) {
+		t.Fatalf("unexpected traces.jsonl content:\n%s", tracesData)
+	}
 }
 
 func waitReady(t *testing.T, port int) {
