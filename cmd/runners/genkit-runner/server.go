@@ -135,8 +135,14 @@ func buildAgentHandler(ctx context.Context, task *v1alpha1.Task, ws *v1alpha1.Wo
 			continue
 		}
 		for _, t := range tools {
-			if reg, ok := t.(api.Registerable); ok {
-				genkit.RegisterAction(g, reg)
+			// In Genkit v1.14.0, GetActiveTools returns MCP tools without
+			// registering them in g's action registry. Guarding with LookupTool
+			// registers them on v1.14.0 and makes this block a safe no-op once
+			// open PR https://github.com/firebase/genkit/pull/6988 lands.
+			if genkit.LookupTool(g, t.Name()) == nil {
+				if reg, ok := t.(api.Registerable); ok {
+					genkit.RegisterAction(g, reg)
+				}
 			}
 			mcpToolNames = append(mcpToolNames, t.Name())
 		}
