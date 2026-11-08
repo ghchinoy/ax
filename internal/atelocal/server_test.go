@@ -17,6 +17,7 @@ package atelocal
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -757,6 +759,7 @@ type mockRunner struct {
 	runErr     error
 	inspectErr error
 	created    map[string]bool
+	execOutput string
 }
 
 func (m *mockRunner) Run(ctx context.Context, args ...string) (string, error) {
@@ -775,6 +778,9 @@ func (m *mockRunner) Run(ctx context.Context, args ...string) (string, error) {
 	}
 	if m.runErr != nil {
 		return "", m.runErr
+	}
+	if len(args) > 0 && args[0] == "exec" && m.execOutput != "" {
+		return m.execOutput, nil
 	}
 	return "ok", nil
 }
@@ -803,4 +809,211 @@ func (m *mockRunner) Inspect(ctx context.Context, containerName string) (*Contai
 		{Hostname: containerName, IPv4Address: "192.168.64.42/24"},
 	}
 	return res, nil
+}
+
+func TestPodmanRunner_ArgsAndInspect(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{in: "", want: RuntimeApple},
+		{in: "apple", want: RuntimeApple},
+		{in: "apple-container", want: RuntimeApple},
+		{in: "podman", want: RuntimePodman},
+		{in: "PODMAN", want: RuntimePodman},
+		{in: "unknown", wantErr: true},
+	} {
+		got, err := NormalizeRuntime(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("NormalizeRuntime(%q) err=%v, wantErr=%v", tc.in, err, tc.wantErr)
+		}
+		if got != tc.want {
+			t.Errorf("NormalizeRuntime(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	gotDel := translatePodmanArgs([]string{"delete", "--force", "ate-default-t1"})
+	wantDel := []string{"rm", "--force", "ate-default-t1"}
+	if !slices.Equal(gotDel, wantDel) {
+		t.Errorf("translatePodmanArgs(delete) = %v, want %v", gotDel, wantDel)
+	}
+
+	gotRun := translatePodmanArgs([]string{"run", "--progress", "none", "-d", "--name", "c1", "--init-image", "vminit:0.1", "debian:12", "sleep", "infinity"})
+	wantRun := []string{"run", "-p", "127.0.0.1::80", "-d", "--name", "c1", "debian:12", "sleep", "infinity"}
+	if !slices.Equal(gotRun, wantRun) {
+		t.Errorf("translatePodmanArgs(run) = %v, want %v", gotRun, wantRun)
+	}
+
+	gotRunExplicitPort := translatePodmanArgs([]string{"run", "--progress=none", "-d", "-p", "127.0.0.1::8080", "--name", "c2", "debian:12"})
+	wantRunExplicitPort := []string{"run", "-d", "-p", "127.0.0.1::8080", "--name", "c2", "debian:12"}
+	if !slices.Equal(gotRunExplicitPort, wantRunExplicitPort) {
+		t.Errorf("translatePodmanArgs(run with explicit port) = %v, want %v", gotRunExplicitPort, wantRunExplicitPort)
+	}
+
+	rawPodmanInspect := `[{
+		"Id": "abc123def",
+		"State": {"Status": "running", "Running": true},
+		"NetworkSettings": {
+			"IPAddress": "10.88.0.5",
+			"Ports": {
+				"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "54123"}]
+			}
+		}
+	}]`
+	insp, err := parsePodmanInspect(rawPodmanInspect, "ate-podman-default-t1")
+	if err != nil {
+		t.Fatalf("parsePodmanInspect failed: %v", err)
+	}
+	if insp.Status.State != "running" {
+		t.Errorf("insp.Status.State = %q, want running", insp.Status.State)
+	}
+	if len(insp.Status.Networks) != 1 || insp.Status.Networks[0].IPv4Address != "127.0.0.1:54123" {
+		t.Errorf("insp.Status.Networks = %+v, want IPv4Address=127.0.0.1:54123", insp.Status.Networks)
+	}
+}
+
+func TestCrossClusterTaskMigration_AppleToPodman(t *testing.T) {
+	ctx := t.Context()
+	snapshotDir := t.TempDir()
+
+	// Cluster A: Apple container runtime
+	fakeTarGz := []byte("fake-workspace-tar-gz-payload-from-apple-container")
+	appleRunner := &mockRunner{
+		created:    make(map[string]bool),
+		execOutput: base64.StdEncoding.EncodeToString(fakeTarGz),
+	}
+	cfgApple := DefaultConfig()
+	cfgApple.Runtime = RuntimeApple
+	cfgApple.ContainerPrefix = "ate-apple"
+	cfgApple.SnapshotDir = snapshotDir
+	cfgApple.ReadyTimeout = 100 * time.Millisecond
+	cfgApple.Runner = appleRunner
+
+	clientApple, cleanupApple := startTestControlServer(t, cfgApple)
+	defer cleanupApple()
+
+	// Cluster B: Podman runtime sharing the same snapshot directory
+	podmanPortLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on ephemeral port: %v", err)
+	}
+	defer podmanPortLis.Close()
+	podmanAddr := podmanPortLis.Addr().String()
+
+	podmanRunner := &mockRunner{
+		created: make(map[string]bool),
+		inspectMap: map[string]*ContainerInspectResult{
+			"ate-podman-default-migrated-task": {
+				ID: "ate-podman-default-migrated-task",
+				Status: struct {
+					State    string `json:"state"`
+					Networks []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					} `json:"networks"`
+				}{
+					State: "running",
+					Networks: []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					}{{Hostname: "ate-podman-default-migrated-task", IPv4Address: podmanAddr}},
+				},
+			},
+		},
+	}
+	cfgPodman := DefaultConfig()
+	cfgPodman.Runtime = RuntimePodman
+	cfgPodman.ContainerPrefix = "ate-podman"
+	cfgPodman.SnapshotDir = snapshotDir
+	cfgPodman.ReadyTimeout = 500 * time.Millisecond
+	cfgPodman.Runner = podmanRunner
+
+	clientPodman, cleanupPodman := startTestControlServer(t, cfgPodman)
+	defer cleanupPodman()
+
+	// 1. Create and Resume task actor on Cluster A (Apple container)
+	_, err = clientApple.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "default",
+				Name:     "migrated-task",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Cluster A CreateActor failed: %v", err)
+	}
+
+	resApple, err := clientApple.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "migrated-task"},
+	})
+	if err != nil {
+		t.Fatalf("Cluster A ResumeActor failed: %v", err)
+	}
+	if gotPod := resApple.GetActor().GetStatus().GetWorkerAssignment().GetWorkerPod(); gotPod != "ate-apple-default-migrated-task" {
+		t.Errorf("Cluster A WorkerPod = %q, want ate-apple-default-migrated-task", gotPod)
+	}
+
+	// 2. Suspend on Cluster A -> snapshots /workspace to snapshotDir/default/migrated-task.tar.gz
+	_, err = clientApple.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "migrated-task"},
+	})
+	if err != nil {
+		t.Fatalf("Cluster A SuspendActor failed: %v", err)
+	}
+
+	snapFile := filepath.Join(snapshotDir, "default", "migrated-task.tar.gz")
+	savedBytes, err := os.ReadFile(snapFile)
+	if err != nil {
+		t.Fatalf("expected snapshot file %s to exist after SuspendActor on Cluster A: %v", snapFile, err)
+	}
+	if !bytes.Equal(savedBytes, fakeTarGz) {
+		t.Errorf("saved snapshot bytes = %q, want %q", savedBytes, fakeTarGz)
+	}
+
+	// 3. Create and Resume the same task actor on Cluster B (Podman)
+	_, err = clientPodman.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "default",
+				Name:     "migrated-task",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Cluster B CreateActor failed: %v", err)
+	}
+
+	resPodman, err := clientPodman.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "migrated-task"},
+	})
+	if err != nil {
+		t.Fatalf("Cluster B ResumeActor failed: %v", err)
+	}
+	if gotPod := resPodman.GetActor().GetStatus().GetWorkerAssignment().GetWorkerPod(); gotPod != "ate-podman-default-migrated-task" {
+		t.Errorf("Cluster B WorkerPod = %q, want ate-podman-default-migrated-task", gotPod)
+	}
+	if gotIP := substrate.WorkerIP(resPodman.GetActor()); gotIP != podmanAddr {
+		t.Errorf("Cluster B WorkerIP = %q, want %q", gotIP, podmanAddr)
+	}
+
+	// Verify Cluster B restored the snapshot via exec into the Podman container
+	podmanRunner.mu.Lock()
+	calls := append([][]string(nil), podmanRunner.runCalls...)
+	podmanRunner.mu.Unlock()
+
+	foundRestoreExec := false
+	wantEncoded := base64.StdEncoding.EncodeToString(fakeTarGz)
+	for _, call := range calls {
+		if len(call) >= 5 && call[0] == "exec" && call[1] == "ate-podman-default-migrated-task" && strings.Contains(call[4], wantEncoded) {
+			foundRestoreExec = true
+			break
+		}
+	}
+	if !foundRestoreExec {
+		t.Errorf("expected Cluster B to restore snapshot via exec, got calls: %v", calls)
+	}
 }

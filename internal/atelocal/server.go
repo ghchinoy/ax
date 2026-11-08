@@ -17,9 +17,11 @@ package atelocal
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -105,9 +107,21 @@ func NewServer(cfg *Config) (*Server, error) {
 		cfg = DefaultConfig()
 	}
 
+	normRuntime, err := NormalizeRuntime(cfg.Runtime)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Runtime = normRuntime
+	if cfg.ContainerPrefix == "" {
+		cfg.ContainerPrefix = "ate"
+	}
+
 	runner := cfg.Runner
 	if runner == nil {
-		runner = NewDefaultContainerRunner(cfg.BinaryPath)
+		runner, err = NewContainerRunner(cfg.Runtime, cfg.BinaryPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	s := &Server{
@@ -429,7 +443,11 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 		port = 80
 	}
 
-	containerName := fmt.Sprintf("ate-%s-%s", sanitizeName(atespace), sanitizeName(name))
+	prefix := s.cfg.ContainerPrefix
+	if prefix == "" {
+		prefix = "ate"
+	}
+	containerName := fmt.Sprintf("%s-%s-%s", sanitizeName(prefix), sanitizeName(atespace), sanitizeName(name))
 	if len(containerName) > 48 {
 		sum := sha256.Sum256([]byte(containerName))
 		containerName = fmt.Sprintf("%s-%x", strings.TrimRight(containerName[:41], "-._"), sum[:3])
@@ -502,6 +520,7 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 	tmpl := s.resolveTemplate(actor.Atespace, actor.TemplateName)
 
 	// Inspect container if it exists
+	freshContainer := false
 	insp, err := s.runner.Inspect(ctx, actor.ContainerName)
 	if err == nil && insp != nil {
 		if insp.Status.State == "running" && actor.ContainerIP != "" {
@@ -514,8 +533,12 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 			return nil, status.Errorf(codes.Internal, "failed to start container %q: %v", actor.ContainerName, err)
 		}
 	} else {
+		freshContainer = true
 		// Run fresh container
 		runArgs := []string{"run", "--progress", "none", "-d", "--name", actor.ContainerName}
+		if s.cfg.Runtime == RuntimePodman && actor.Port > 0 {
+			runArgs = append(runArgs, "-p", fmt.Sprintf("127.0.0.1::%d", actor.Port))
+		}
 		initImg := tmpl.InitImage
 		if initImg == "" {
 			initImg = s.cfg.InitImage
@@ -574,6 +597,12 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 		}
 	}
 
+	if freshContainer && s.cfg.SnapshotDir != "" {
+		if err := s.restoreWorkspaceSnapshot(ctx, actor); err != nil {
+			slog.Warn("failed to restore workspace snapshot", "actor", key, "error", err)
+		}
+	}
+
 	s.mu.Lock()
 	actor.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
 	actor.ContainerIP = ip
@@ -621,6 +650,12 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 		return nil, status.Errorf(codes.NotFound, "actor %q not found", key)
 	}
 
+	if s.cfg.SnapshotDir != "" {
+		if err := s.saveWorkspaceSnapshot(ctx, actor); err != nil {
+			slog.Warn("failed to save workspace snapshot", "actor", key, "error", err)
+		}
+	}
+
 	_, _ = s.runner.Run(ctx, "stop", "--time", "2", actor.ContainerName)
 
 	s.mu.Lock()
@@ -630,6 +665,62 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 	s.mu.Unlock()
 
 	return &ateapipb.SuspendActorResponse{}, nil
+}
+
+func (s *Server) snapshotPath(atespace, actorName string) string {
+	if atespace == "" {
+		atespace = "default"
+	}
+	return filepath.Join(s.cfg.SnapshotDir, sanitizeName(atespace), sanitizeName(actorName)+".tar.gz")
+}
+
+func (s *Server) saveWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) error {
+	out, err := s.runner.Run(ctx, "exec", actor.ContainerName, "sh", "-c", "test -d /workspace && tar -czf - -C /workspace . | base64 | tr -d '\\n\\r'")
+	if err != nil {
+		return err
+	}
+	encoded := strings.TrimSpace(out)
+	if encoded == "" {
+		return nil
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return fmt.Errorf("decoding workspace snapshot base64: %w", err)
+	}
+	path := s.snapshotPath(actor.Atespace, actor.Name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("creating snapshot directory: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("writing snapshot file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("committing snapshot file: %w", err)
+	}
+	slog.Info("saved workspace snapshot", "actor", resourceKey(actor.Atespace, actor.Name), "path", path, "bytes", len(data))
+	return nil
+}
+
+func (s *Server) restoreWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) error {
+	path := s.snapshotPath(actor.Atespace, actor.Name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading snapshot file: %w", err)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	script := fmt.Sprintf("mkdir -p /workspace && printf '%%s' '%s' | base64 -d | tar -xzf - -C /workspace", encoded)
+	if _, err := s.runner.Run(ctx, "exec", actor.ContainerName, "sh", "-c", script); err != nil {
+		return err
+	}
+	slog.Info("restored workspace snapshot", "actor", resourceKey(actor.Atespace, actor.Name), "path", path, "bytes", len(data))
+	return nil
 }
 
 // RevertActor reverts a crashed or running actor to SUSPENDED state.

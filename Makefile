@@ -38,7 +38,7 @@ CLAUDE_CODE_BASE_IMAGE ?=
 # Prefer container on macOS, then podman, fall back to docker.
 CONTAINER_CLI ?= $(shell command -v container 2>/dev/null || command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 
-.PHONY: build install images check-image-repo build-claude-code-image push-claude-code-image deploy deploy-server deploy-postgres apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean build-ate-local run-ate-local local-up local-down local-status local-logs local-reset
+.PHONY: build install images check-image-repo build-claude-code-image push-claude-code-image deploy deploy-server deploy-postgres apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean build-ate-local run-ate-local local-up local-down local-multi-up local-multi-down local-status local-logs local-reset
 
 ## --------------------------------------
 ## Build Targets
@@ -68,6 +68,12 @@ local-up:
 
 local-down:
 	./examples/ate_local/local-stack.sh down
+
+local-multi-up:
+	./examples/ate_local/local-stack.sh multi-up
+
+local-multi-down:
+	./examples/ate_local/local-stack.sh multi-down
 
 local-status:
 	./examples/ate_local/local-stack.sh status
