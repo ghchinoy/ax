@@ -1,59 +1,25 @@
-# ate-local: Local Agent Substrate on Apple Container
+# `examples/ate_local`: Local Agent Substrate & Multi-Cluster Demo
 
-`ate-local` is a standalone daemon that implements the **Agent Substrate `Control` gRPC API** (`ateapipb.ControlServer`), backed by the macOS native **Apple `container` runtime**.
+This directory contains configuration, manifests, and helper scripts for running AX locally on macOS via `ate-local` (backed by Apple `container` and/or `podman`) without Kubernetes.
 
-It allows upstream `ax` (and other Substrate clients) to run agent harnesses inside isolated Apple containers locally on macOS without requiring a Kubernetes cluster, GCS, Redis, or cloud resources.
-
----
-
-## Architecture
-
-```
-                 +--------------------------------+
-                 |    ax-server (TaskReconciler)  |
-                 +---------------+----------------+
-                                 |
-                 Control gRPC    | (CreateActor, ResumeActor, SuspendActor)
-                 target: :50051  |
-                                 v
-                 +--------------------------------+
-                 |           ate-local            |
-                 | (Substrate Control gRPC Server)|
-                 +---------------+----------------+
-                                 |
-                      CLI subprocess commands
-                      (/usr/local/bin/container)
-                                 |
-               +-----------------+-----------------+
-               |                                   |
-    container run -d ...                container inspect / stop
-               |                                   |
-               v                                   v
-    +-----------------------+           +-----------------------+
-    |   Actor Container 1   |           |   Actor Container 2   |
-    | (192.168.64.x:50053)  |           | (192.168.64.y:50053)  |
-    |  - HarnessService     |           |  - HarnessService     |
-    +-----------------------+           +-----------------------+
-```
+For the full architecture, upstream issue/PR context, and dual-cluster migration design, see **[`docs/ate-local.md`](../../docs/ate-local.md)**.
 
 ---
 
-## How It Works
+## Files in This Directory
 
-1. **`CreateActor`**: Registers an actor in an atespace (e.g. `ax/my-actor`) associated with an `ActorTemplate`.
-2. **`ResumeActor`**:
-   - Launches an Apple container for the actor (`container run -d --name ate-<atespace>-<name> ...`).
-   - Retrieves the container's routable IP on the macOS `vmnet` bridge (`192.168.64.x`).
-   - Returns the IP as `Actor.Status.WorkerAssignment.WorkerPodIps[0]`.
-   - AX then connects to `WorkerPodIps[0]` directly to check `/readyz` and stream execution turns.
-3. **`SuspendActor`**: Stops the container (`container stop`), freeing up CPU and memory resources on the Mac.
-4. **`DeleteActor`**: Tears down and deletes the container (`container delete --force`).
+| File | Description |
+|---|---|
+| `local-stack.sh` | Starts and manages the full local AX stack (`up`, `down`, `status`, `logs`, `reset`) as well as the dual-cluster migration topology (`multi-up`, `multi-down`, `migrate`). |
+| `task-local.yaml` | Example `Workspace` and `Task` manifest (`debug: true`) configured for local `linux/arm64` execution. |
+| `ate-local.yaml` | Standalone configuration example for running `cmd/ate-local` directly. |
+| `run_demo.sh` / `demo_client.go` / `worker/` | Standalone `ateapi/v1.ControlServer` gRPC demo exercising `ate-local` directly without `ax-server`. |
 
 ---
 
-## Full AX Stack Quickstart
+## Quickstart
 
-To run real AX Tasks (`ax apply`, `ax resume`, `ax ssh`) against Apple containers, start the whole stack: PostgreSQL, `ate-local`, and `ax-server`.
+### Single Cluster (Apple `container`)
 
 ```bash
 make local-up
@@ -68,54 +34,20 @@ ax delete task local-task
 make local-down
 ```
 
-See [docs/ate-local.md](../../docs/ate-local.md) for the helper's commands, what AX needs from PostgreSQL, and troubleshooting.
-
-## Control Plane Demo
-
-To exercise only `ate-local`'s Control API, run the automated demo:
+### Dual Cluster Task Migration (Apple `container` $\leftrightarrow$ `podman`)
 
 ```bash
-./examples/ate_local/run_demo.sh
-```
+make local-multi-up
+source .ax-local/env
 
-Or run step-by-step:
+ax --server $AX_SERVER_A apply -f examples/ate_local/task-local.yaml
+ax --server $AX_SERVER_A resume local-task
+ax --server $AX_SERVER_A ssh local-task -- sh -c 'echo "step 1 on cluster A" > /workspace/progress.txt'
 
-### 1. Build and Start `ate-local`
+./examples/ate_local/local-stack.sh migrate local-task
 
-```bash
-go build -o bin/ate-local ./cmd/ate-local
-./bin/ate-local --config examples/ate_local/ate-local.yaml
-```
+ax --server $AX_SERVER_B describe task local-task
+ax --server $AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
 
-### 2. Run an Actor turn
-
-```bash
-go run ./examples/ate_local/demo_client.go --actor my-test-actor
-```
-
----
-
-## Configuration (`ate-local.yaml`)
-
-```yaml
-address: "127.0.0.1:50051"
-ready_timeout: "20s"
-
-templates:
-  # General container template
-  default:
-    image: "debian:12"
-    port: 50053
-    command: ["sleep", "infinity"]
-    cpus: 2
-    memory: "1024M"
-
-  # Custom harness template
-  ax-harness-antigravity-template:
-    image: "ax-harness-antigravity:latest"
-    port: 50053
-    cpus: 4
-    memory: "2048M"
-    env:
-      PYTHONUNBUFFERED: "1"
+make local-multi-down
 ```

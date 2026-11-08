@@ -935,7 +935,7 @@ func TestCrossClusterTaskMigration_AppleToPodman(t *testing.T) {
 	defer cleanupPodman()
 
 	// 1. Create and Resume task actor on Cluster A (Apple container)
-	_, err = clientApple.CreateActor(ctx, &ateapipb.CreateActorRequest{
+	createdApple, err := clientApple.CreateActor(ctx, &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
 			Metadata: &ateapipb.ResourceMetadata{
 				Atespace: "default",
@@ -945,6 +945,9 @@ func TestCrossClusterTaskMigration_AppleToPodman(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Cluster A CreateActor failed: %v", err)
+	}
+	if createdApple.GetMetadata().GetUid() == "" {
+		t.Errorf("expected CreateActor to populate Metadata.Uid")
 	}
 
 	resApple, err := clientApple.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
@@ -958,11 +961,14 @@ func TestCrossClusterTaskMigration_AppleToPodman(t *testing.T) {
 	}
 
 	// 2. Suspend on Cluster A -> snapshots /workspace to snapshotDir/default/migrated-task.tar.gz
-	_, err = clientApple.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
+	suspApple, err := clientApple.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
 		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "migrated-task"},
 	})
 	if err != nil {
 		t.Fatalf("Cluster A SuspendActor failed: %v", err)
+	}
+	if suspApple.GetActor().GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("SuspendActor response actor state = %v, want SUSPENDED", suspApple.GetActor().GetStatus().GetState())
 	}
 
 	snapFile := filepath.Join(snapshotDir, "default", "migrated-task.tar.gz")
