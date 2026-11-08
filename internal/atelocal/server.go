@@ -321,6 +321,18 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 	if tc.Image == "" {
 		tc.Image = "debian:12"
 	}
+	// Images in ghcr.io/rakyll/ax-images/* already ship a multi-arch linux/arm64
+	// /usr/local/bin/ax-task-runner (linked to /usr/local/bin/ax-agent). Skip
+	// bind-mounting the host's default ax-task-runner over it.
+	if strings.HasPrefix(tc.Image, "ghcr.io/rakyll/ax-images/") {
+		var filtered []string
+		for _, v := range tc.Volumes {
+			if !strings.HasSuffix(v, ":/usr/local/bin/ax-task-runner") {
+				filtered = append(filtered, v)
+			}
+		}
+		tc.Volumes = filtered
+	}
 
 	s.mu.Lock()
 	s.templates[key] = tc
