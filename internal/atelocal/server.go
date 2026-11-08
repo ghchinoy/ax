@@ -39,6 +39,7 @@ import (
 type ActorRecord struct {
 	Atespace          string
 	Name              string
+	UID               string
 	TemplateNamespace string
 	TemplateName      string
 	ContainerName     string
@@ -73,6 +74,7 @@ func (r *ActorRecord) toProto() *ateapipb.Actor {
 		Metadata: &ateapipb.ResourceMetadata{
 			Atespace:   r.Atespace,
 			Name:       r.Name,
+			Uid:        r.UID,
 			CreateTime: createTime,
 			UpdateTime: updateTime,
 		},
@@ -454,9 +456,12 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	}
 
 	now := time.Now()
+	uidSum := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d", atespace, name, now.UnixNano())))
+	actorUID := fmt.Sprintf("%x-%x-%x-%x-%x", uidSum[0:4], uidSum[4:6], uidSum[6:8], uidSum[8:10], uidSum[10:16])
 	record := &ActorRecord{
 		Atespace:          atespace,
 		Name:              name,
+		UID:               actorUID,
 		TemplateNamespace: templateNamespace,
 		TemplateName:      templateName,
 		ContainerName:     containerName,
@@ -662,9 +667,12 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 	actor.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 	actor.ContainerIP = ""
 	actor.UpdatedAt = time.Now()
+	actorProto := actor.toProto()
 	s.mu.Unlock()
 
-	return &ateapipb.SuspendActorResponse{}, nil
+	return &ateapipb.SuspendActorResponse{
+		Actor: actorProto,
+	}, nil
 }
 
 func (s *Server) snapshotPath(atespace, actorName string) string {
