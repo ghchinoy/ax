@@ -1,6 +1,6 @@
 # Local Agent Substrate on Apple Container (`ate-local`)
 
-`ate-local` is a lightweight, local control plane that implements the **Agent Substrate Control API** (`go.ate.dev/substrate/pkg/proto/ateapipb.ControlServer`), backed by the native macOS **Apple `container`** CLI runtime (`/usr/local/bin/container`).
+`ate-local` is a lightweight, local control plane that implements the **Agent Substrate Control API** (`go.ate.dev/substrate/api/ateapi/v1.ControlServer`), backed by the native macOS **Apple `container`** CLI runtime (`/usr/local/bin/container`).
 
 ---
 
