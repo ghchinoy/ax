@@ -54,6 +54,20 @@ SUBSTRATE_PORT="${AX_LOCAL_SUBSTRATE_PORT:-50051}"
 SERVER_PORT="${AX_LOCAL_SERVER_PORT:-8090}"
 SUBSTRATE_B_PORT="${AX_LOCAL_SUBSTRATE_B_PORT:-50052}"
 SERVER_B_PORT="${AX_LOCAL_SERVER_B_PORT:-8091}"
+if [[ -n "${AX_LOCAL_METRICS_PORT:-}" ]]; then
+  METRICS_ADDR="${HOST}:${AX_LOCAL_METRICS_PORT}"
+elif [[ "${SERVER_PORT}" == "8090" ]]; then
+  METRICS_ADDR="${HOST}:9090"
+else
+  METRICS_ADDR=""
+fi
+if [[ -n "${AX_LOCAL_METRICS_B_PORT:-}" ]]; then
+  METRICS_B_ADDR="${HOST}:${AX_LOCAL_METRICS_B_PORT}"
+elif [[ "${SERVER_B_PORT}" == "8091" ]]; then
+  METRICS_B_ADDR="${HOST}:9091"
+else
+  METRICS_B_ADDR=""
+fi
 POSTGRES_NAME="${AX_LOCAL_POSTGRES_NAME:-ax-local-postgres}"
 POSTGRES_IMAGE="${AX_LOCAL_POSTGRES_IMAGE:-postgres:17-alpine}"
 STATE_DIR="${AX_LOCAL_DIR:-${REPO_ROOT}/.ax-local}"
@@ -208,7 +222,7 @@ start_postgres() {
   fi
   wait_for_port "PostgreSQL" "${POSTGRES_PORT}"
   local deadline=$((SECONDS + WAIT_SECONDS))
-  while ! container exec "${POSTGRES_NAME}" pg_isready -U ax -d ax >/dev/null 2>&1; do
+  while ! container exec "${POSTGRES_NAME}" psql -U ax -d ax -c "SELECT 1" >/dev/null 2>&1; do
     if (( SECONDS >= deadline )); then
       die "PostgreSQL did not become ready within ${WAIT_SECONDS}s"
     fi
@@ -272,6 +286,7 @@ cmd_up() {
     env ATENET_ROUTER_ADDR="${HOST}:${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ax-server" \
     --addr "${HOST}:${SERVER_PORT}" \
+    --metrics-addr "${METRICS_ADDR}" \
     --store "postgres://ax:ax@${HOST}:${POSTGRES_PORT}/ax?sslmode=disable" \
     --substrate-endpoint "${HOST}:${SUBSTRATE_PORT}" \
     --substrate-plaintext \
@@ -335,6 +350,7 @@ cmd_multi_up() {
     env ATENET_ROUTER_ADDR="${HOST}:${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ax-server" \
     --addr "${HOST}:${SERVER_PORT}" \
+    --metrics-addr "${METRICS_ADDR}" \
     --store "postgres://ax:ax@${HOST}:${POSTGRES_PORT}/ax?sslmode=disable" \
     --substrate-endpoint "${HOST}:${SUBSTRATE_PORT}" \
     --substrate-plaintext \
@@ -347,6 +363,7 @@ cmd_multi_up() {
     env ATENET_ROUTER_ADDR="${HOST}:${SUBSTRATE_B_PORT}" \
     "${BIN_DIR}/ax-server" \
     --addr "${HOST}:${SERVER_B_PORT}" \
+    --metrics-addr "${METRICS_B_ADDR}" \
     --store "postgres://ax:ax@${HOST}:${POSTGRES_PORT}/ax_cluster_b?sslmode=disable" \
     --substrate-endpoint "${HOST}:${SUBSTRATE_B_PORT}" \
     --substrate-plaintext \

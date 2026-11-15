@@ -25,6 +25,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -648,6 +649,7 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 
 	// Inspect container if it exists
 	freshContainer := false
+	preMountedWorkspace := false
 	insp, err := s.runner.Inspect(ctx, actor.ContainerName)
 	if err == nil && insp != nil {
 		if insp.Status.State == "running" && actor.ContainerIP != "" {
@@ -678,6 +680,12 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 		}
 		for _, vol := range tmpl.Volumes {
 			runArgs = append(runArgs, "-v", resolveVolumeSpec(vol))
+		}
+		if s.cfg.SnapshotDir != "" {
+			if wsHostDir, ok := s.stagePreBootWorkspace(actor, tmpl); ok {
+				runArgs = append(runArgs, "-v", fmt.Sprintf("%s:/workspace", wsHostDir))
+				preMountedWorkspace = true
+			}
 		}
 		if tmpl.WorkDir != "" {
 			runArgs = append(runArgs, "-w", tmpl.WorkDir)
@@ -724,7 +732,7 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 		}
 	}
 
-	if freshContainer && s.cfg.SnapshotDir != "" {
+	if freshContainer && s.cfg.SnapshotDir != "" && !preMountedWorkspace {
 		if err := s.restoreWorkspaceSnapshot(ctx, actor); err != nil {
 			slog.Warn("failed to restore workspace snapshot", "actor", key, "error", err)
 		}
@@ -838,6 +846,55 @@ func (s *Server) saveWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) 
 	}
 	slog.Info("saved workspace snapshot", "actor", resourceKey(actor.Atespace, actor.Name), "path", path, "bytes", len(data))
 	return nil
+}
+
+var wsNameFromYAMLRe = regexp.MustCompile(`(?m)^\s*name:\s*["']?([a-zA-Z0-9._-]+)["']?\s*$`)
+
+// stagePreBootWorkspace extracts an actor's snapshot (or warm workspace tag
+// snapshot) into a host directory before `container run` / `podman run` so
+// /workspace is populated at T=0 before PID 1 (`ax-task-runner`) starts.
+// Returns ("", false) when no valid tar.gz archive exists (falling back to
+// post-boot restoreWorkspaceSnapshot).
+func (s *Server) stagePreBootWorkspace(actor *ActorRecord, tmpl TemplateConfig) (string, bool) {
+	candidates := []string{s.snapshotPath(actor.Atespace, actor.Name)}
+	if actor.SourceTag != "" {
+		candidates = append(candidates, s.tagSnapshotPath(actor.Atespace, actor.SourceTag))
+	}
+	if wsYAML := tmpl.Env["AX_WORKSPACE_YAML"]; wsYAML != "" {
+		if m := wsNameFromYAMLRe.FindStringSubmatch(wsYAML); len(m) == 2 {
+			candidates = append(candidates, s.tagSnapshotPath(actor.Atespace, m[1]+"-warm"))
+		}
+	}
+
+	var snapPath string
+	for _, c := range candidates {
+		hdr, err := os.ReadFile(c)
+		// Check gzip magic header (0x1f, 0x8b) so unit tests using synthetic
+		// non-gzip byte slices keep exercising post-boot restoreWorkspaceSnapshot.
+		if err == nil && len(hdr) >= 2 && hdr[0] == 0x1f && hdr[1] == 0x8b {
+			snapPath = c
+			break
+		}
+	}
+	if snapPath == "" {
+		return "", false
+	}
+
+	atespace := actor.Atespace
+	if atespace == "" {
+		atespace = "default"
+	}
+	hostDir := filepath.Join(s.cfg.SnapshotDir, "workdirs", sanitizeName(s.cfg.ContainerPrefix), sanitizeName(atespace), sanitizeName(actor.Name))
+	_ = os.RemoveAll(hostDir)
+	if err := os.MkdirAll(hostDir, 0o755); err != nil {
+		return "", false
+	}
+	if err := exec.Command("tar", "-xzf", snapPath, "-C", hostDir).Run(); err != nil {
+		_ = os.RemoveAll(hostDir)
+		return "", false
+	}
+	slog.Info("pre-staged workspace snapshot before container boot", "actor", resourceKey(actor.Atespace, actor.Name), "snapshot", snapPath, "hostDir", hostDir)
+	return hostDir, true
 }
 
 func (s *Server) restoreWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) error {
