@@ -31,7 +31,8 @@ metadata:
   name: local-task
   atespace: default
 spec:
-  image: "debian:12"
+  profile:
+    image: "debian:12"
   env:
     - name: ENVIRONMENT
       value: "local"

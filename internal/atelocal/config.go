@@ -26,6 +26,7 @@ import (
 type TemplateConfig struct {
 	Atespace  string            `yaml:"atespace,omitempty"`
 	Name      string            `yaml:"name,omitempty"`
+	UID       string            `yaml:"-"`
 	Image     string            `yaml:"image"`
 	InitImage string            `yaml:"init_image,omitempty"`
 	Port      int               `yaml:"port,omitempty"` // Guest/readyz or HarnessService port in container (default 80)

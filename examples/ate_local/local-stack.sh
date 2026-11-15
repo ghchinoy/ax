@@ -182,8 +182,11 @@ write_env() {
   cat >"${ENV_FILE}" <<EOF
 # source this file to point the ax CLI at the local stack
 export AX_SERVER=localhost:${SERVER_PORT}
+export ATENET_ROUTER_ADDR=${HOST}:${SUBSTRATE_PORT}
 export AX_SERVER_A=localhost:${SERVER_PORT}
+export ATENET_ROUTER_ADDR_A=${HOST}:${SUBSTRATE_PORT}
 export AX_SERVER_B=localhost:${SERVER_B_PORT}
+export ATENET_ROUTER_ADDR_B=${HOST}:${SUBSTRATE_B_PORT}
 export PATH="${BIN_DIR}:\${PATH}"
 EOF
 }
@@ -266,6 +269,7 @@ cmd_up() {
   start_component ate-local "${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ate-local" --config "${CONFIG_FILE}"
   start_component ax-server "${SERVER_PORT}" \
+    env ATENET_ROUTER_ADDR="${HOST}:${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ax-server" \
     --addr "${HOST}:${SERVER_PORT}" \
     --store "postgres://ax:ax@${HOST}:${POSTGRES_PORT}/ax?sslmode=disable" \
@@ -328,6 +332,7 @@ cmd_multi_up() {
   start_component ate-local "${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ate-local" --config "${CONFIG_FILE}"
   start_component ax-server "${SERVER_PORT}" \
+    env ATENET_ROUTER_ADDR="${HOST}:${SUBSTRATE_PORT}" \
     "${BIN_DIR}/ax-server" \
     --addr "${HOST}:${SERVER_PORT}" \
     --store "postgres://ax:ax@${HOST}:${POSTGRES_PORT}/ax?sslmode=disable" \
@@ -339,6 +344,7 @@ cmd_multi_up() {
   start_component ate-local-b "${SUBSTRATE_B_PORT}" \
     "${BIN_DIR}/ate-local" --config "${CONFIG_B_FILE}"
   start_component ax-server-b "${SERVER_B_PORT}" \
+    env ATENET_ROUTER_ADDR="${HOST}:${SUBSTRATE_B_PORT}" \
     "${BIN_DIR}/ax-server" \
     --addr "${HOST}:${SERVER_B_PORT}" \
     --store "postgres://ax:ax@${HOST}:${POSTGRES_PORT}/ax_cluster_b?sslmode=disable" \
@@ -352,17 +358,17 @@ cmd_multi_up() {
   cat <<EOF
 
 Dual-cluster AX stack is up:
-  Cluster A (apple):               AX_SERVER_A=localhost:${SERVER_PORT}  -> ate-local (${HOST}:${SUBSTRATE_PORT})
-  Cluster B (${CLUSTER_B_RUNTIME}):               AX_SERVER_B=localhost:${SERVER_B_PORT}  -> ate-local-b (${HOST}:${SUBSTRATE_B_PORT})
+  Cluster A (apple):               AX_SERVER_A=localhost:${SERVER_PORT}  ATENET_ROUTER_ADDR_A=${HOST}:${SUBSTRATE_PORT}
+  Cluster B (${CLUSTER_B_RUNTIME}):               AX_SERVER_B=localhost:${SERVER_B_PORT}  ATENET_ROUTER_ADDR_B=${HOST}:${SUBSTRATE_B_PORT}
   Shared /workspace snapshot dir:  ${SNAPSHOT_DIR#"${REPO_ROOT}/"}
 
 Try migrating a task across clusters:
   source ${ENV_FILE#"${REPO_ROOT}/"}
-  ax --server \$AX_SERVER_A apply -f examples/ate_local/task-local.yaml
-  ax --server \$AX_SERVER_A resume local-task
-  ax --server \$AX_SERVER_A ssh local-task -- sh -c 'echo "written on cluster A" > /workspace/progress.txt'
+  ATENET_ROUTER_ADDR=\$ATENET_ROUTER_ADDR_A ax --server \$AX_SERVER_A apply -f examples/ate_local/task-local.yaml
+  ATENET_ROUTER_ADDR=\$ATENET_ROUTER_ADDR_A ax --server \$AX_SERVER_A resume local-task
+  ATENET_ROUTER_ADDR=\$ATENET_ROUTER_ADDR_A ax --server \$AX_SERVER_A ssh local-task -- sh -c 'echo "written on cluster A" > /workspace/progress.txt'
   examples/ate_local/local-stack.sh migrate local-task
-  ax --server \$AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
+  ATENET_ROUTER_ADDR=\$ATENET_ROUTER_ADDR_B ax --server \$AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
 EOF
 }
 
@@ -374,16 +380,16 @@ cmd_migrate() {
   [[ -x "${ax_bin}" ]] || ax_bin="ax"
 
   info "1/3 Suspending task '${task_name}' (atespace '${atespace}') on Cluster A (localhost:${SERVER_PORT}) to snapshot /workspace..."
-  "${ax_bin}" --server "localhost:${SERVER_PORT}" -n "${atespace}" suspend "${task_name}"
+  "${ax_bin}" --server "localhost:${SERVER_PORT}" -a "${atespace}" suspend "${task_name}"
 
   info "2/3 Exporting task '${task_name}' from Cluster A and applying to Cluster B (localhost:${SERVER_B_PORT})..."
-  "${ax_bin}" --server "localhost:${SERVER_PORT}" -n "${atespace}" get task "${task_name}" -o yaml |
-    awk '/^status:/ { exit } { print }' |
-    "${ax_bin}" --server "localhost:${SERVER_B_PORT}" -n "${atespace}" apply -f -
+  "${ax_bin}" --server "localhost:${SERVER_PORT}" -a "${atespace}" get task "${task_name}" -o yaml |
+    awk '/^status:/ { exit } /^  (uid|createTime|updateTime|deleteTime):/ { next } { print }' |
+    "${ax_bin}" --server "localhost:${SERVER_B_PORT}" -a "${atespace}" apply -f -
 
   info "3/3 Resuming task '${task_name}' on Cluster B (localhost:${SERVER_B_PORT}) and hydrating /workspace snapshot..."
-  "${ax_bin}" --server "localhost:${SERVER_B_PORT}" -n "${atespace}" resume "${task_name}"
-  "${ax_bin}" --server "localhost:${SERVER_B_PORT}" -n "${atespace}" describe task "${task_name}"
+  "${ax_bin}" --server "localhost:${SERVER_B_PORT}" -a "${atespace}" resume "${task_name}"
+  "${ax_bin}" --server "localhost:${SERVER_B_PORT}" -a "${atespace}" describe task "${task_name}"
 }
 
 cmd_down() {

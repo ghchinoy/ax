@@ -19,9 +19,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -85,6 +87,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 	server.Register(grpcServer)
 	reflection.Register(grpcServer)
+	httpServer := server.NewHTTPServer(cfg.Address, grpcServer)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -92,20 +95,20 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down ate-local daemon")
-		grpcServer.GracefulStop()
-
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+		grpcServer.Stop()
 		_ = server.Close(shutdownCtx)
 	}()
 
-	slog.Info("ate-local Substrate Control server listening",
+	slog.Info("ate-local Substrate Control + atenet-router server listening",
 		"address", lis.Addr().String(),
 		"runtime", cfg.Runtime,
 		"containerPrefix", cfg.ContainerPrefix,
 		"snapshotDir", cfg.SnapshotDir,
 	)
-	if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+	if err := httpServer.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server failed", "error", err)
 		os.Exit(1)
 	}

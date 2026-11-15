@@ -1,6 +1,6 @@
 # Local Agent Substrate (`ate-local`): Architecture, Multi-Cluster Mobility & Operations Guide
 
-`ate-local` is a standalone, zero-Kubernetes local control plane that implements the **Agent Substrate Control gRPC API** (`go.ate.dev/substrate/api/ateapi/v1.ControlServer`), backed by either the native macOS **Apple `container`** runtime (`/usr/local/bin/container` on `Virtualization.framework`) or **Podman** (`podman`).
+`ate-local` is a standalone, zero-Kubernetes local control and data plane that implements the **Agent Substrate Control gRPC API** (`go.ate.dev/substrate/api/ateapi/v1.ControlServer` on Agent Substrate `v1.0.0`) together with an embedded **`atenet-router`** (`ate-target-actor` HTTP/1.1 + HTTP/2 `h2c` reverse proxy), backed by either the native macOS **Apple `container`** runtime (`/usr/local/bin/container` on `Virtualization.framework`) or **Podman** (`podman`).
 
 It allows `ax-server`, `TaskReconciler`, and the `ax` CLI to provision, resume, inspect (`ax ssh`), suspend, and migrate real Linux sandboxed tasks locally on a developer machine without requiring a Kubernetes cluster (`kind` or GKE), gVisor, Envoy (`atenet-router`), or Google Cloud Storage.
 
@@ -16,11 +16,11 @@ Running AX against a full Agent Substrate installation requires Kubernetes 1.36+
 
 | Upstream Issue / PR | Relationship to `ate-local` |
 |---|---|
-| **[#526](https://github.com/google/ax/issues/526) (Local development)**, **[#543](https://github.com/google/ax/issues/543) (AX Studio)** & **[PR #560](https://github.com/google/ax/pull/560) (Roadmap: Local Development)** | Directly addresses the roadmap goal *"Install and run AX locally without having to set up container tooling or a Kubernetes cluster"* (#560) and the #543 open question on how AX Studio can provision local clusters and manage multiple clusters on a laptop without a heavy Kubernetes/Kind stack. |
-| **[PR #558](https://github.com/google/ax/pull/558) (`ax local` on Kind POC)** | Complementary tier: PR #558 provisions full Kubernetes + Substrate inside `kind` (requiring Docker/Podman, a $\ge 6.8$ host kernel, and ~5.4k lines of embedded manifests). `ate-local` implements `ateapi/v1.ControlServer` directly in ~1,000 lines of Go under `internal/atelocal` with sub-second task startup on macOS. |
-| **[#518](https://github.com/google/ax/issues/518) / [PR #551](https://github.com/google/ax/pull/551) (Keep maiden-run marker on `/workspace`)** & **[#555](https://github.com/google/ax/issues/555) (`/ax-state` volume)** | `ate-local` implements `SNAPSHOT_FIDELITY_VOLUMES` semantics by archiving `/workspace` to `<snapshot_dir>/<atespace>/<actor>.tar.gz` on `SuspendActor` and hydrating it on `ResumeActor`. Because #551 stores the `.ax/initialized` marker inside `/workspace`, resuming a migrated task on a second `ate-local` cluster preserves agent edits without re-running maiden workspace setup. |
-| **[#515](https://github.com/google/ax/pull/515) / [#517](https://github.com/google/ax/pull/517) (Direct `ax-server` reconciliation + PostgreSQL)** & **[#534](https://github.com/google/ax/issues/534) / [PR #536](https://github.com/google/ax/pull/536) (Explicit `Suspend`/`Resume`)** | `ax-server` stores only resource specs and distributed lease locks in PostgreSQL, reading live actor state and `WorkerPodIps` from Substrate on every `GetTask`/`ListTasks`. This separation enables clean suspend $\rightarrow$ export/apply $\rightarrow$ resume task mobility across independent Substrate clusters. |
-| **[PR #553](https://github.com/google/ax/pull/553) (Substrate `v1.0.0-rc.1`)**, **[#539](https://github.com/google/ax/issues/539) (`Ready` condition `UpdateTime`)** & **[PR #556](https://github.com/google/ax/pull/556) (`residency` & `actorUid`)** | `ate-local` implements `go.ate.dev/substrate/api/ateapi/v1.ControlServer`, populates `Metadata.Uid`, `Metadata.CreateTime`, and `Metadata.UpdateTime` on every actor transition, and returns the updated `Actor` in `SuspendActorResponse`. |
+| **[#526](https://github.com/google/ax/issues/526) (Local development)**, **[#543](https://github.com/google/ax/issues/543) (AX Studio)**, **[PR #560](https://github.com/google/ax/pull/560) (Roadmap)** & **[PR #590](https://github.com/google/ax/pull/590) (`hack/hero-demo`)** | Directly addresses the roadmap goal *"Install and run AX locally without having to set up container tooling or a Kubernetes cluster"* (#560), AX Studio's zero-K8s laptop cluster workflow (#543), and Steps 1 & 5 of the v0.1 Hero Demo harness (#590). |
+| **[PR #558](https://github.com/google/ax/pull/558) (`ax local` on Kind POC)** | Complementary tier: PR #558 provisions full Kubernetes + Substrate inside `kind` (requiring Docker/Podman, a $\ge 6.8$ host kernel, and ~5.4k lines of embedded manifests). `ate-local` implements `ateapi/v1.ControlServer` + `atenet-router` directly in Go under `internal/atelocal` with sub-second task startup on macOS. |
+| **[Epic #563](https://github.com/google/ax/issues/563): `Profile` ([#586](https://github.com/google/ax/pull/586)), `Task` ([#587](https://github.com/google/ax/pull/587)), `Gateway` ([#585](https://github.com/google/ax/pull/585)), & Warm `Workspace` `Tag`s ([#584](https://github.com/google/ax/issues/584) / [#592](https://github.com/google/ax/pull/592))** | Supports `TaskSpec.profile` (`image`, `resources`, `ateActorTemplate`), `Gateway` egress policy binding (`default` `EgressPolicy`), snapshot `Tag` CRUD (`CreateTag`, `GetTag`, `ListTags`, `DeleteTag`) + `CreateActor(source_tag)`, and `ATENET_ROUTER_ADDR` routing for `ax ssh` after #587 removed `TaskStatus.worker_ip`. |
+| **[#518](https://github.com/google/ax/issues/518) / [PR #551](https://github.com/google/ax/pull/551) (Keep maiden-run marker on `/workspace`)** & **[#555](https://github.com/google/ax/issues/555) (`/ax-state` volume)** | `ate-local` implements `SNAPSHOT_FIDELITY_VOLUMES` semantics by archiving `/workspace` to `<snapshot_dir>/<atespace>/<actor>.tar.gz` on `SuspendActor` (and copying to `tags/<tag>.tar.gz` on `CreateTag`) and hydrating it on `ResumeActor`. Because #551 stores `.ax/initialized` inside `/workspace`, resuming a migrated task on a second cluster preserves agent edits without re-running maiden workspace setup. |
+| **[PR #561](https://github.com/google/ax/pull/561) (Substrate `v1.0.0`)**, **[#539](https://github.com/google/ax/issues/539) (`UpdateTime`)** & **[PR #556](https://github.com/google/ax/pull/556) (`actorUid`)** | Implements `go.ate.dev/substrate/api/ateapi/v1.ControlServer` (`v1.0.0`), populates `Metadata.Uid`, `Metadata.CreateTime`, and `Metadata.UpdateTime`, and records completed `Snapshot` generations on suspend. |
 
 ---
 
@@ -35,20 +35,23 @@ Running AX against a full Agent Substrate installation requires Kubernetes 1.36+
 | **Actor Networking (`WorkerPodIps[0]`)** | Pod IP routed via `atenet-router` | Direct routable `vmnet` bridge IP (`192.168.64.x`) | Published localhost port (`127.0.0.1:<hostPort>`) |
 | **Actor Suspend (`SuspendActor`)** | `runsc` checkpoint / volume snapshot to GCS | Archives `/workspace` to `snapshot_dir` + `container stop` | Archives `/workspace` to `snapshot_dir` + `podman stop` |
 | **Actor Resume (`ResumeActor`)** | Hydrates snapshot into worker pod | Starts/creates Apple container + restores `/workspace` snapshot | Starts/creates Podman container + restores `/workspace` snapshot |
-| **Guest Exec (`ax ssh`)** | Direct TCP probe or `atenet-router` mTLS | Direct gRPC to `192.168.64.x:80` | Direct gRPC to `127.0.0.1:<hostPort>` |
+| **Guest Exec (`ax ssh`) & Ingress** | `atenet-router` (`ate-target-actor`) | Embedded `atenet-router` on `ate-local` (`ATENET_ROUTER_ADDR=127.0.0.1:50051`) -> `192.168.64.x:80` | Embedded `atenet-router` on `ate-local` (`ATENET_ROUTER_ADDR=127.0.0.1:50052`) -> `127.0.0.1:<hostPort>` |
 
 ### Why Both Runtimes Work Without Modifying `ax` or `ax-server`
 
-Both `TaskReconciler.Resume` (`internal/controller/reconciler.go`) and `ax ssh` (`cmd/ax/main.go`) inspect `WorkerPodIps[0]` with `net.SplitHostPort(workerIP)`:
-
-- **Apple `container` (`runtime: apple`):** Assigns each container a dedicated IPv4 address on the macOS `vmnet` bridge (`192.168.64.x`). `ate-local` returns `"192.168.64.x"` in `WorkerPodIps[0]`, and `ax-server` / `ax ssh` connect to `192.168.64.x:80`.
-- **Podman (`runtime: podman`):** Because Podman on macOS runs inside a Linux VM whose internal bridge network (`10.88.0.x`) is not directly routable from the macOS host, `ate-local` launches containers with `-p 127.0.0.1::<port>` and parses `podman inspect` (`NetworkSettings.Ports`) to return `"127.0.0.1:<hostPort>"` in `WorkerPodIps[0]`. Both `ax-server`'s `/readyz?check=workspace` probe and `ax ssh` automatically split the host and port and connect to `127.0.0.1:<hostPort>`.
+1. **Readiness Probing (`TaskReconciler.Resume`):** `internal/controller/reconciler.go` inspects `WorkerPodIps[0]` with `net.SplitHostPort(workerIP)`:
+   - **Apple `container` (`runtime: apple`):** Assigns each container a dedicated IPv4 address on the macOS `vmnet` bridge (`192.168.64.x`). `ate-local` returns `"192.168.64.x"` in `WorkerPodIps[0]`.
+   - **Podman (`runtime: podman`):** Launches containers with `-p 127.0.0.1::<port>` and parses `podman inspect` (`NetworkSettings.Ports`) to return `"127.0.0.1:<hostPort>"` in `WorkerPodIps[0]`.
+2. **Embedded `atenet-router` Data Plane (`ax ssh` & HTTP/gRPC Wake-on-Request):**
+   - `ax ssh` (`cmd/ax/main.go`) connects through `ATENET_ROUTER_ADDR`, sending HTTP/2 (`h2c`) gRPC requests with the `ate-target-actor: <atespace>/<actor>` metadata header.
+   - `ate-local` multiplexes HTTP/1.1 and unencrypted HTTP/2 (`h2c`) on its listener (`:50051`): requests carrying `ate-target-actor` wake suspended actors on demand and stream directly to the actor's `192.168.64.x:80` (Apple `container`) or `127.0.0.1:<hostPort>` (Podman) endpoint, while Control gRPC RPCs dispatch to `ControlServer`.
 
 ### Control API Surface Implemented (`internal/atelocal`)
 
 - **Atespaces:** `CreateAtespace`, `GetAtespace`, `ListAtespaces`, `DeleteAtespace`
-- **ActorTemplates:** `CreateActorTemplate`, `GetActorTemplate`, `ListActorTemplates`, `DeleteActorTemplate` (maps `containers[0]` image, command, env, wakeup probe port, and CPU/memory resource limits)
-- **Actors:** `CreateActor`, `GetActor`, `ListActors`, `ResumeActor`, `SuspendActor`, `RevertActor`, `DeleteActor`
+- **ActorTemplates:** `CreateActorTemplate`, `GetActorTemplate`, `ListActorTemplates`, `DeleteActorTemplate` (populates `Metadata.Uid`; maps `containers[0]` image, command, env, wakeup probe port, and CPU/memory resource limits)
+- **Actors:** `CreateActor` (including `source_tag` seeding), `GetActor`, `ListActors`, `ResumeActor`, `SuspendActor`, `RevertActor`, `DeleteActor`
+- **Snapshot Tags:** `CreateTag`, `GetTag`, `ListTags`, `DeleteTag`
 - **Egress Policies:** `CreateActorEgressPolicy`, `GetActorEgressPolicy`, `UpdateActorEgressPolicy`, `DeleteActorEgressPolicy`
 - **Workers:** `ListWorkers`
 
@@ -146,20 +149,20 @@ make local-multi-up
 source .ax-local/env
 
 # 2. Create and resume a task on Cluster A (Apple container)
-ax --server $AX_SERVER_A apply -f examples/ate_local/task-local.yaml
-ax --server $AX_SERVER_A resume local-task
-ax --server $AX_SERVER_A describe task local-task
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_A ax --server $AX_SERVER_A apply -f examples/ate_local/task-local.yaml
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_A ax --server $AX_SERVER_A resume local-task
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_A ax --server $AX_SERVER_A describe task local-task
 
 # 3. Write work inside /workspace on Cluster A
-ax --server $AX_SERVER_A ssh local-task -- sh -c \
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_A ax --server $AX_SERVER_A ssh local-task -- sh -c \
   'echo "checkpointed on Cluster A ($(hostname))" > /workspace/progress.txt && cat /workspace/progress.txt'
 
 # 4. Migrate the task from Cluster A (:8090) to Cluster B (:8091)
 ./examples/ate_local/local-stack.sh migrate local-task
 
 # 5. Inspect and verify the migrated task on Cluster B
-ax --server $AX_SERVER_B describe task local-task
-ax --server $AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_B ax --server $AX_SERVER_B describe task local-task
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_B ax --server $AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
 
 # 6. Tear down both clusters when finished
 make local-multi-down

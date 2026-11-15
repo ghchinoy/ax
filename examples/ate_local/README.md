@@ -40,14 +40,14 @@ make local-down
 make local-multi-up
 source .ax-local/env
 
-ax --server $AX_SERVER_A apply -f examples/ate_local/task-local.yaml
-ax --server $AX_SERVER_A resume local-task
-ax --server $AX_SERVER_A ssh local-task -- sh -c 'echo "step 1 on cluster A" > /workspace/progress.txt'
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_A ax --server $AX_SERVER_A apply -f examples/ate_local/task-local.yaml
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_A ax --server $AX_SERVER_A resume local-task
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_A ax --server $AX_SERVER_A ssh local-task -- sh -c 'echo "step 1 on cluster A" > /workspace/progress.txt'
 
 ./examples/ate_local/local-stack.sh migrate local-task
 
-ax --server $AX_SERVER_B describe task local-task
-ax --server $AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_B ax --server $AX_SERVER_B describe task local-task
+ATENET_ROUTER_ADDR=$ATENET_ROUTER_ADDR_B ax --server $AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
 
 make local-multi-down
 ```

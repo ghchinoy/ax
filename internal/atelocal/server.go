@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -32,22 +35,31 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+func deterministicUUID(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
+}
+
 // ActorRecord holds state for a managed actor in the local Control plane.
 type ActorRecord struct {
-	Atespace          string
-	Name              string
-	UID               string
-	TemplateNamespace string
-	TemplateName      string
-	ContainerName     string
-	ContainerIP       string
-	Port              int
-	State             ateapipb.ActorState
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	Atespace           string
+	Name               string
+	UID                string
+	TemplateNamespace  string
+	TemplateName       string
+	TemplateUID        string
+	SourceTag          string
+	ContainerName      string
+	ContainerIP        string
+	Port               int
+	State              ateapipb.ActorState
+	SnapshotGeneration int32
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 func (r *ActorRecord) toProto() *ateapipb.Actor {
@@ -70,6 +82,26 @@ func (r *ActorRecord) toProto() *ateapipb.Actor {
 	} else if createTime != nil {
 		updateTime = createTime
 	}
+	var sourceTag *ateapipb.ObjectRef
+	if r.SourceTag != "" {
+		sourceTag = &ateapipb.ObjectRef{
+			Atespace: r.Atespace,
+			Name:     r.SourceTag,
+		}
+	}
+	var snapshots []*ateapipb.Snapshot
+	if r.SnapshotGeneration > 0 {
+		snapshots = []*ateapipb.Snapshot{{
+			Uuid:             fmt.Sprintf("snap-%s-%d", sanitizeName(r.Name), r.SnapshotGeneration),
+			Generation:       r.SnapshotGeneration,
+			Owner:            ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+			Fidelity:         ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+			ActorTemplateUid: r.TemplateUID,
+			DurableSnapshot: &ateapipb.SnapshotStorage{
+				State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+			},
+		}}
+	}
 	return &ateapipb.Actor{
 		Metadata: &ateapipb.ResourceMetadata{
 			Atespace:   r.Atespace,
@@ -82,25 +114,32 @@ func (r *ActorRecord) toProto() *ateapipb.Actor {
 			Atespace: r.TemplateNamespace,
 			Name:     r.TemplateName,
 		},
+		SourceTag: sourceTag,
 		Status: &ateapipb.ActorStatus{
-			State:            r.State,
-			WorkerAssignment: assignment,
+			State:                  r.State,
+			WorkerAssignment:       assignment,
+			Snapshots:              snapshots,
+			LastAssignedGeneration: r.SnapshotGeneration,
 		},
 	}
 }
 
-// Server implements ateapipb.ControlServer for local macOS environments backed by Apple container.
+// Server implements ateapipb.ControlServer and a local atenet-router proxy
+// backed by Apple container or Podman.
 type Server struct {
 	ateapipb.UnimplementedControlServer
 
-	cfg    *Config
-	runner ContainerRunner
+	cfg        *Config
+	runner     ContainerRunner
+	http1Trans *http.Transport
+	h2cTrans   *http.Transport
 
 	mu             sync.RWMutex
 	atespaces      map[string]bool
 	templates      map[string]TemplateConfig         // key: atespace/name
 	actors         map[string]*ActorRecord           // key: atespace/name
 	egressPolicies map[string]*ateapipb.EgressPolicy // key: atespace/actorName
+	tags           map[string]*ateapipb.Tag          // key: atespace/tagName
 }
 
 // NewServer creates a new local Substrate Control server instance.
@@ -126,13 +165,21 @@ func NewServer(cfg *Config) (*Server, error) {
 		}
 	}
 
+	h1Trans := http.DefaultTransport.(*http.Transport).Clone()
+	h2Trans := http.DefaultTransport.(*http.Transport).Clone()
+	h2Trans.Protocols = new(http.Protocols)
+	h2Trans.Protocols.SetUnencryptedHTTP2(true)
+
 	s := &Server{
 		cfg:            cfg,
 		runner:         runner,
+		http1Trans:     h1Trans,
+		h2cTrans:       h2Trans,
 		atespaces:      make(map[string]bool),
 		templates:      make(map[string]TemplateConfig),
 		actors:         make(map[string]*ActorRecord),
 		egressPolicies: make(map[string]*ateapipb.EgressPolicy),
+		tags:           make(map[string]*ateapipb.Tag),
 	}
 
 	for k, v := range cfg.Templates {
@@ -149,6 +196,9 @@ func NewServer(cfg *Config) (*Server, error) {
 		}
 		v.Atespace = atespace
 		v.Name = name
+		if v.UID == "" {
+			v.UID = deterministicUUID("template/" + resourceKey(atespace, name))
+		}
 		s.templates[resourceKey(atespace, name)] = v
 	}
 
@@ -256,6 +306,11 @@ func (s *Server) DeleteAtespace(ctx context.Context, req *ateapipb.DeleteAtespac
 			return nil, status.Errorf(codes.FailedPrecondition, "cannot delete atespace %q: actors still exist", name)
 		}
 	}
+	for _, tag := range s.tags {
+		if tag.GetMetadata().GetAtespace() == name {
+			return nil, status.Errorf(codes.FailedPrecondition, "cannot delete atespace %q: tags still exist", name)
+		}
+	}
 
 	delete(s.atespaces, name)
 	return &ateapipb.Atespace{
@@ -335,11 +390,24 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 		tc.Volumes = filtered
 	}
 
+	tmplUID := tmpl.GetMetadata().GetUid()
+	if tmplUID == "" {
+		tmplUID = deterministicUUID("template/" + key)
+	}
+	tc.UID = tmplUID
+
 	s.mu.Lock()
 	s.templates[key] = tc
 	s.mu.Unlock()
 
-	return tmpl, nil
+	out := proto.Clone(tmpl).(*ateapipb.ActorTemplate)
+	if out.Metadata == nil {
+		out.Metadata = &ateapipb.ResourceMetadata{}
+	}
+	out.Metadata.Atespace = atespace
+	out.Metadata.Name = name
+	out.Metadata.Uid = tmplUID
+	return out, nil
 }
 
 // GetActorTemplate retrieves an ActorTemplate by atespace and name.
@@ -352,15 +420,24 @@ func (s *Server) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTem
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	tc, ok := s.lookupTemplateLocked(ref.GetAtespace(), ref.GetName())
+	atespace := ref.GetAtespace()
+	if atespace == "" {
+		atespace = "default"
+	}
+	tc, ok := s.lookupTemplateLocked(atespace, ref.GetName())
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "template %q not found", ref.GetName())
+	}
+	uid := tc.UID
+	if uid == "" {
+		uid = deterministicUUID("template/" + resourceKey(atespace, ref.GetName()))
 	}
 
 	return &ateapipb.ActorTemplate{
 		Metadata: &ateapipb.ResourceMetadata{
 			Atespace: ref.GetAtespace(),
 			Name:     ref.GetName(),
+			Uid:      uid,
 		},
 		Containers: []*ateapipb.Container{{
 			Name:    "guest",
@@ -381,10 +458,15 @@ func (s *Server) ListActorTemplates(ctx context.Context, req *ateapipb.ListActor
 		if filterAtespace != "" && tc.Atespace != filterAtespace {
 			continue
 		}
+		uid := tc.UID
+		if uid == "" {
+			uid = deterministicUUID("template/" + resourceKey(tc.Atespace, tc.Name))
+		}
 		list = append(list, &ateapipb.ActorTemplate{
 			Metadata: &ateapipb.ResourceMetadata{
 				Atespace: tc.Atespace,
 				Name:     tc.Name,
+				Uid:      uid,
 			},
 			Containers: []*ateapipb.Container{{
 				Name:    "guest",
@@ -453,6 +535,32 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	}
 
 	tc := s.resolveTemplateLocked(atespace, templateName)
+	tmplAtespace := templateNamespace
+	if tmplAtespace == "" {
+		tmplAtespace = atespace
+	}
+	templateUID := tc.UID
+	if templateUID == "" {
+		templateUID = deterministicUUID("template/" + resourceKey(tmplAtespace, templateName))
+	}
+
+	sourceTagName := ""
+	if tagRef := actor.GetSourceTag(); tagRef != nil && tagRef.GetName() != "" {
+		tagAtespace := tagRef.GetAtespace()
+		if tagAtespace == "" {
+			tagAtespace = atespace
+		}
+		tag, ok := s.tags[resourceKey(tagAtespace, tagRef.GetName())]
+		if !ok {
+			return nil, status.Errorf(codes.NotFound, "source tag %s/%s not found", tagAtespace, tagRef.GetName())
+		}
+		tagUID := tag.GetStatus().GetActorTemplateUid()
+		if tagUID != "" && templateUID != "" && tagUID != templateUID {
+			return nil, status.Errorf(codes.InvalidArgument, "source tag template uid %q does not match actor template uid %q", tagUID, templateUID)
+		}
+		sourceTagName = tagRef.GetName()
+	}
+
 	port := tc.Port
 	if port == 0 {
 		port = 80
@@ -469,14 +577,15 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	}
 
 	now := time.Now()
-	uidSum := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d", atespace, name, now.UnixNano())))
-	actorUID := fmt.Sprintf("%x-%x-%x-%x-%x", uidSum[0:4], uidSum[4:6], uidSum[6:8], uidSum[8:10], uidSum[10:16])
+	actorUID := deterministicUUID(fmt.Sprintf("%s/%s/%d", atespace, name, now.UnixNano()))
 	record := &ActorRecord{
 		Atespace:          atespace,
 		Name:              name,
 		UID:               actorUID,
 		TemplateNamespace: templateNamespace,
 		TemplateName:      templateName,
+		TemplateUID:       templateUID,
+		SourceTag:         sourceTagName,
 		ContainerName:     containerName,
 		Port:              port,
 		State:             ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
@@ -679,6 +788,7 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 	s.mu.Lock()
 	actor.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 	actor.ContainerIP = ""
+	actor.SnapshotGeneration++
 	actor.UpdatedAt = time.Now()
 	actorProto := actor.toProto()
 	s.mu.Unlock()
@@ -693,6 +803,13 @@ func (s *Server) snapshotPath(atespace, actorName string) string {
 		atespace = "default"
 	}
 	return filepath.Join(s.cfg.SnapshotDir, sanitizeName(atespace), sanitizeName(actorName)+".tar.gz")
+}
+
+func (s *Server) tagSnapshotPath(atespace, tagName string) string {
+	if atespace == "" {
+		atespace = "default"
+	}
+	return filepath.Join(s.cfg.SnapshotDir, sanitizeName(atespace), "tags", sanitizeName(tagName)+".tar.gz")
 }
 
 func (s *Server) saveWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) error {
@@ -727,10 +844,16 @@ func (s *Server) restoreWorkspaceSnapshot(ctx context.Context, actor *ActorRecor
 	path := s.snapshotPath(actor.Atespace, actor.Name)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if os.IsNotExist(err) && actor.SourceTag != "" {
+			path = s.tagSnapshotPath(actor.Atespace, actor.SourceTag)
+			data, err = os.ReadFile(path)
 		}
-		return fmt.Errorf("reading snapshot file: %w", err)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("reading snapshot file: %w", err)
+		}
 	}
 	if len(data) == 0 {
 		return nil
@@ -861,6 +984,9 @@ func (s *Server) CreateActorEgressPolicy(ctx context.Context, req *ateapipb.Crea
 
 // GetActorEgressPolicy retrieves the egress policy for the specified Actor.
 func (s *Server) GetActorEgressPolicy(ctx context.Context, req *ateapipb.GetActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	if req.GetName() != "" && req.GetName() != "default" {
+		return nil, status.Errorf(codes.InvalidArgument, "name: Invalid value: %q: must be \"default\"", req.GetName())
+	}
 	ref := req.GetActor()
 	if ref == nil || ref.GetName() == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "actor ref is required")
@@ -936,6 +1062,144 @@ func (s *Server) ListWorkers(ctx context.Context, req *ateapipb.ListWorkersReque
 	}, nil
 }
 
+// CreateTag captures an immutable snapshot Tag from a suspended source Actor.
+func (s *Server) CreateTag(ctx context.Context, req *ateapipb.CreateTagRequest) (*ateapipb.Tag, error) {
+	in := req.GetTag()
+	if in == nil || in.GetMetadata() == nil || in.GetMetadata().GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "tag with metadata.name is required")
+	}
+	atespace := in.GetMetadata().GetAtespace()
+	if atespace == "" {
+		atespace = "default"
+	}
+	tagName := in.GetMetadata().GetName()
+	tagKey := resourceKey(atespace, tagName)
+
+	srcRef := in.GetSourceActor()
+	if srcRef == nil || srcRef.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "source_actor is required")
+	}
+	srcAtespace := srcRef.GetAtespace()
+	if srcAtespace == "" {
+		srcAtespace = atespace
+	}
+	srcKey := resourceKey(srcAtespace, srcRef.GetName())
+
+	s.mu.Lock()
+	if _, exists := s.tags[tagKey]; exists {
+		s.mu.Unlock()
+		return nil, status.Errorf(codes.AlreadyExists, "tag %q already exists", tagKey)
+	}
+	srcActor, ok := s.actors[srcKey]
+	if !ok {
+		s.mu.Unlock()
+		return nil, status.Errorf(codes.NotFound, "source actor %q not found", srcKey)
+	}
+	if srcActor.State != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		s.mu.Unlock()
+		return nil, status.Errorf(codes.FailedPrecondition, "source actor %q must be suspended", srcKey)
+	}
+	tmplUID := srcActor.TemplateUID
+	s.mu.Unlock()
+
+	if s.cfg.SnapshotDir != "" {
+		srcSnap := s.snapshotPath(srcAtespace, srcRef.GetName())
+		if data, err := os.ReadFile(srcSnap); err == nil {
+			dstSnap := s.tagSnapshotPath(atespace, tagName)
+			if err := os.MkdirAll(filepath.Dir(dstSnap), 0o755); err != nil {
+				return nil, status.Errorf(codes.Internal, "creating tag snapshot dir: %v", err)
+			}
+			if err := os.WriteFile(dstSnap, data, 0o644); err != nil {
+				return nil, status.Errorf(codes.Internal, "writing tag snapshot: %v", err)
+			}
+		}
+	}
+
+	now := timestamppb.Now()
+	tagUID := deterministicUUID(fmt.Sprintf("tag/%s/%d", tagKey, now.GetNanos()))
+	tag := proto.Clone(in).(*ateapipb.Tag)
+	tag.Metadata = &ateapipb.ResourceMetadata{
+		Atespace:   atespace,
+		Name:       tagName,
+		Uid:        tagUID,
+		CreateTime: now,
+		UpdateTime: now,
+	}
+	tag.Status = &ateapipb.TagStatus{
+		ActorTemplateUid: tmplUID,
+		Snapshot: &ateapipb.Snapshot{
+			Uuid:             "snap-" + sanitizeName(tagName),
+			Generation:       1,
+			Owner:            ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG,
+			Fidelity:         ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+			ActorTemplateUid: tmplUID,
+			DurableSnapshot: &ateapipb.SnapshotStorage{
+				State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+			},
+		},
+	}
+
+	s.mu.Lock()
+	if _, exists := s.tags[tagKey]; exists {
+		s.mu.Unlock()
+		return nil, status.Errorf(codes.AlreadyExists, "tag %q already exists", tagKey)
+	}
+	s.tags[tagKey] = tag
+	s.mu.Unlock()
+
+	return proto.Clone(tag).(*ateapipb.Tag), nil
+}
+
+// GetTag retrieves a Tag by atespace and name.
+func (s *Server) GetTag(ctx context.Context, req *ateapipb.GetTagRequest) (*ateapipb.Tag, error) {
+	ref := req.GetTag()
+	if ref == nil || ref.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "tag ref is required")
+	}
+	s.mu.RLock()
+	tag, ok := s.tags[resourceKey(ref.GetAtespace(), ref.GetName())]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "tag %q not found", resourceKey(ref.GetAtespace(), ref.GetName()))
+	}
+	return proto.Clone(tag).(*ateapipb.Tag), nil
+}
+
+// ListTags lists Tags, optionally filtered by atespace.
+func (s *Server) ListTags(ctx context.Context, req *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	resp := &ateapipb.ListTagsResponse{}
+	for _, tag := range s.tags {
+		if req.GetAtespace() == "" || tag.GetMetadata().GetAtespace() == req.GetAtespace() {
+			resp.Tags = append(resp.Tags, proto.Clone(tag).(*ateapipb.Tag))
+		}
+	}
+	return resp, nil
+}
+
+// DeleteTag removes a Tag and its snapshot copy.
+func (s *Server) DeleteTag(ctx context.Context, req *ateapipb.DeleteTagRequest) (*ateapipb.Tag, error) {
+	ref := req.GetTag()
+	if ref == nil || ref.GetName() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "tag ref is required")
+	}
+	k := resourceKey(ref.GetAtespace(), ref.GetName())
+	s.mu.Lock()
+	tag, ok := s.tags[k]
+	if ok {
+		delete(s.tags, k)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "tag %q not found", k)
+	}
+	if s.cfg.SnapshotDir != "" {
+		_ = os.Remove(s.tagSnapshotPath(ref.GetAtespace(), ref.GetName()))
+	}
+	return proto.Clone(tag).(*ateapipb.Tag), nil
+}
+
 // Close gracefully stops all active containers.
 func (s *Server) Close(ctx context.Context) error {
 	s.mu.Lock()
@@ -948,10 +1212,130 @@ func (s *Server) Close(ctx context.Context) error {
 	for _, a := range actors {
 		_, _ = s.runner.Run(ctx, "stop", "--time", "2", a.ContainerName)
 	}
+	if s.http1Trans != nil {
+		s.http1Trans.CloseIdleConnections()
+	}
+	if s.h2cTrans != nil {
+		s.h2cTrans.CloseIdleConnections()
+	}
 	return nil
 }
 
 // Register registers the server with a gRPC server.
 func (s *Server) Register(grpcServer *grpc.Server) {
 	ateapipb.RegisterControlServer(grpcServer, s)
+}
+
+// Handler returns an HTTP/1.1 + unencrypted HTTP/2 (h2c) handler that multiplexes:
+//   - requests carrying the "ate-target-actor" header (the local atenet-router
+//     data plane used by `ax ssh` and ATENET_ROUTER_ADDR readiness/HTTP probes,
+//     resuming suspended actors on demand),
+//   - GET /healthz health checks, and
+//   - the Agent Substrate Control gRPC service on grpcServer.
+func (s *Server) Handler(grpcServer *grpc.Server) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if target := strings.TrimSpace(r.Header.Get("ate-target-actor")); target != "" {
+			s.serveActorProxy(w, r, target)
+			return
+		}
+		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcServer.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
+		http.NotFound(w, r)
+	})
+}
+
+// NewHTTPServer builds an *http.Server configured for both HTTP/1.1 and
+// unencrypted HTTP/2 (h2c) serving s.Handler(grpcServer).
+func (s *Server) NewHTTPServer(addr string, grpcServer *grpc.Server) *http.Server {
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: s.Handler(grpcServer),
+	}
+	srv.Protocols = new(http.Protocols)
+	srv.Protocols.SetHTTP1(true)
+	srv.Protocols.SetUnencryptedHTTP2(true)
+	return srv
+}
+
+func parseTargetActor(target string) (atespace, name string) {
+	if parts := strings.SplitN(target, "/", 2); len(parts) == 2 {
+		if parts[0] == "" {
+			return "default", parts[1]
+		}
+		return parts[0], parts[1]
+	}
+	return "default", target
+}
+
+func (s *Server) resolveActorEndpoint(ctx context.Context, target string) (string, error) {
+	atespace, name := parseTargetActor(target)
+	key := resourceKey(atespace, name)
+
+	s.mu.RLock()
+	actor, ok := s.actors[key]
+	var state ateapipb.ActorState
+	var ip string
+	var port int
+	if ok {
+		state = actor.State
+		ip = actor.ContainerIP
+		port = actor.Port
+	}
+	s.mu.RUnlock()
+
+	if !ok {
+		return "", status.Errorf(codes.NotFound, "actor %q not found", key)
+	}
+	if state != ateapipb.ActorState_ACTOR_STATE_RUNNING || ip == "" {
+		res, err := s.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+			Actor: &ateapipb.ObjectRef{Atespace: atespace, Name: name},
+		})
+		if err != nil {
+			return "", err
+		}
+		ips := res.GetActor().GetStatus().GetWorkerAssignment().GetWorkerPodIps()
+		if len(ips) > 0 {
+			ip = ips[0]
+		}
+	}
+	if port <= 0 {
+		port = 80
+	}
+	if _, _, err := net.SplitHostPort(ip); err == nil {
+		return ip, nil
+	}
+	return net.JoinHostPort(ip, fmt.Sprintf("%d", port)), nil
+}
+
+func (s *Server) serveActorProxy(w http.ResponseWriter, r *http.Request, target string) {
+	endpoint, err := s.resolveActorEndpoint(r.Context(), target)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	upstreamURL := &url.URL{
+		Scheme: "http",
+		Host:   endpoint,
+	}
+	transport := s.http1Trans
+	if r.ProtoMajor == 2 {
+		transport = s.h2cTrans
+	}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(upstreamURL)
+			pr.Out.Host = endpoint
+			pr.Out.Header.Del("ate-target-actor")
+		},
+		Transport:     transport,
+		FlushInterval: -1,
+	}
+	proxy.ServeHTTP(w, r)
 }

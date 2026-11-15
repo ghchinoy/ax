@@ -33,6 +33,7 @@ import (
 
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/guest"
+	"github.com/google/ax/internal/metadata"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
@@ -454,22 +455,38 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 	reconciler.WorkspaceReadyTimeout = 2 * time.Second
 
 	ctx := t.Context()
+	gw := &v1alpha1.Gateway{
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "e2e-gw",
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.GatewaySpec{
+			Egress: []*ateapipb.EgressRule{{
+				Https: &ateapipb.HttpsRule{
+					Hostnames: []string{"api.anthropic.com"},
+				},
+			}},
+		},
+	}
 	task := &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{
 			Name:     "e2e-task",
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image:   "debian:12",
-			Command: []string{"sleep", "infinity"},
+			Profile: &v1alpha1.Profile{
+				Image: "debian:12",
+			},
+			Commands: []string{"sleep", "infinity"},
+			Gateway:  &v1alpha1.GatewayRef{Name: "e2e-gw"},
 		},
 		Status: &v1alpha1.TaskStatus{
-			Phase: "Running",
+			State: v1alpha1.TaskState_TASK_STATE_WORKING,
 		},
 	}
 
-	// 1. Resume active task -> should set WorkspaceReady=True
-	if err := reconciler.Resume(ctx, task, nil); err != nil {
+	// 1. Resume active task -> should bind Gateway egress policy and set WorkspaceReady=True
+	if err := reconciler.Resume(ctx, task, nil, gw); err != nil {
 		t.Fatalf("Resume failed: %v", err)
 	}
 	for _, wantCond := range []string{"WorkspaceReady"} {
@@ -485,7 +502,7 @@ func TestControlServer_ReconcilerIntegration(t *testing.T) {
 	}
 
 	// 2. Suspend -> should suspend actor on ate-local
-	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+	if err := reconciler.Suspend(ctx, task, nil, gw); err != nil {
 		t.Fatalf("Suspend failed: %v", err)
 	}
 	actor, err := subClient.GetActor(ctx, "default", "e2e-task")
@@ -630,8 +647,10 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 
 	grpcServer := grpc.NewServer()
 	srv.Register(grpcServer)
-	go func() { _ = grpcServer.Serve(lis) }()
+	httpServer := srv.NewHTTPServer("", grpcServer)
+	go func() { _ = httpServer.Serve(lis) }()
 	defer func() {
+		_ = httpServer.Close()
 		grpcServer.Stop()
 		_ = srv.Close(context.Background())
 	}()
@@ -659,16 +678,18 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image:   "debian:12",
-			Command: []string{"sleep", "infinity"},
-			Debug:   true, // enables guest ProcessService (ax ssh)
+			Profile: &v1alpha1.Profile{
+				Image: "debian:12",
+			},
+			Commands: []string{"sleep", "infinity"},
+			Debug:    true, // enables guest ProcessService (ax ssh)
 		},
 		Status: &v1alpha1.TaskStatus{
-			Phase: "Running",
+			State: v1alpha1.TaskState_TASK_STATE_WORKING,
 		},
 	}
 
-	if err := reconciler.Resume(ctx, task, nil); err != nil {
+	if err := reconciler.Resume(ctx, task, nil, nil); err != nil {
 		t.Fatalf("Resume(%q) failed: %v", taskName, err)
 	}
 
@@ -694,10 +715,10 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 		}
 	}
 
-	// Dial guest daemon (ax ssh) inside the live Apple container over vmnet IP:80
-	guestClient, err := guest.Dial(fmt.Sprintf("%s:80", workerIP))
+	// Dial guest daemon (ax ssh) through ate-local's built-in atenet-router proxy
+	guestClient, err := guest.DialTarget(lis.Addr().String(), "default/"+taskName)
 	if err != nil {
-		t.Fatalf("guest.Dial(%s:80) failed: %v", workerIP, err)
+		t.Fatalf("guest.DialTarget(%s, default/%s) failed: %v", lis.Addr().String(), taskName, err)
 	}
 	defer guestClient.Close()
 
@@ -710,13 +731,19 @@ func TestControlServer_LiveReconcilerAndGuestExec(t *testing.T) {
 	if err != nil || exitCode != 0 {
 		t.Fatalf("guestClient.Exec(uname -sm) exit=%d err=%v stderr=%s", exitCode, err, stderr.String())
 	}
-	t.Logf("Live ax ssh guest exec inside Apple container (%s:80) output: %s", workerIP, strings.TrimSpace(stdout.String()))
+	t.Logf("Live ax ssh guest exec via ate-local router (%s -> %s:80) output: %s", lis.Addr().String(), workerIP, strings.TrimSpace(stdout.String()))
 	if !strings.Contains(stdout.String(), "Linux") {
 		t.Errorf("unexpected uname output from container: %q", stdout.String())
 	}
 }
 
 func startTestControlServer(t *testing.T, cfg *Config) (ateapipb.ControlClient, func()) {
+	t.Helper()
+	client, _, cleanup := startTestControlServerWithAddr(t, cfg)
+	return client, cleanup
+}
+
+func startTestControlServerWithAddr(t *testing.T, cfg *Config) (ateapipb.ControlClient, string, func()) {
 	t.Helper()
 	srv, err := NewServer(cfg)
 	if err != nil {
@@ -730,9 +757,10 @@ func startTestControlServer(t *testing.T, cfg *Config) (ateapipb.ControlClient, 
 
 	grpcServer := grpc.NewServer()
 	srv.Register(grpcServer)
+	httpServer := srv.NewHTTPServer("", grpcServer)
 
 	go func() {
-		_ = grpcServer.Serve(lis)
+		_ = httpServer.Serve(lis)
 	}()
 
 	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -744,12 +772,13 @@ func startTestControlServer(t *testing.T, cfg *Config) (ateapipb.ControlClient, 
 
 	cleanup := func() {
 		_ = conn.Close()
+		_ = httpServer.Close()
 		grpcServer.Stop()
 		_ = lis.Close()
 		_ = srv.Close(context.Background())
 	}
 
-	return client, cleanup
+	return client, lis.Addr().String(), cleanup
 }
 
 type mockRunner struct {
@@ -1021,5 +1050,179 @@ func TestCrossClusterTaskMigration_AppleToPodman(t *testing.T) {
 	}
 	if !foundRestoreExec {
 		t.Errorf("expected Cluster B to restore snapshot via exec, got calls: %v", calls)
+	}
+}
+
+func TestTagAndRouterProxy(t *testing.T) {
+	ctx := t.Context()
+	snapshotDir := t.TempDir()
+
+	// Start an in-process AX metadata + guest gRPC server representing a running task container.
+	metaSrv := metadata.NewServer(0, &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "seeded-actor", Atespace: "default"},
+		Spec:     &v1alpha1.TaskSpec{Debug: true},
+	}, nil, metadata.ServerOptions{WorkspacePath: t.TempDir()})
+	if err := metaSrv.Start(); err != nil {
+		t.Fatalf("metaSrv.Start failed: %v", err)
+	}
+	defer func() { _ = metaSrv.Stop(context.Background()) }()
+	metaSrv.SetWorkspaceReady(true)
+	probeAddr := metaSrv.ProbeAddr()
+
+	fakeTarGz := []byte("prewarmed-workspace-tag-archive")
+	runner := &mockRunner{
+		created:    make(map[string]bool),
+		execOutput: base64.StdEncoding.EncodeToString(fakeTarGz),
+		inspectMap: map[string]*ContainerInspectResult{
+			"ate-default-setup-actor": {
+				ID: "ate-default-setup-actor",
+				Status: struct {
+					State    string `json:"state"`
+					Networks []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					} `json:"networks"`
+				}{
+					State: "running",
+					Networks: []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					}{{Hostname: "ate-default-setup-actor", IPv4Address: probeAddr}},
+				},
+			},
+			"ate-default-seeded-actor": {
+				ID: "ate-default-seeded-actor",
+				Status: struct {
+					State    string `json:"state"`
+					Networks []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					} `json:"networks"`
+				}{
+					State: "running",
+					Networks: []struct {
+						Hostname    string `json:"hostname"`
+						IPv4Address string `json:"ipv4Address"`
+						IPv4Gateway string `json:"ipv4Gateway"`
+					}{{Hostname: "ate-default-seeded-actor", IPv4Address: probeAddr}},
+				},
+			},
+		},
+	}
+
+	cfg := DefaultConfig()
+	cfg.SnapshotDir = snapshotDir
+	cfg.ReadyTimeout = 500 * time.Millisecond
+	cfg.Runner = runner
+
+	client, serverAddr, cleanup := startTestControlServerWithAddr(t, cfg)
+	defer cleanup()
+
+	// 1. Provision template and setup actor, resume and suspend to capture snapshot, then CreateTag.
+	tmpl, err := client.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{
+		ActorTemplate: &ateapipb.ActorTemplate{
+			Metadata:   &ateapipb.ResourceMetadata{Atespace: "default", Name: "ax-tmpl"},
+			Containers: []*ateapipb.Container{{Name: "guest", Image: "debian:12"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateActorTemplate failed: %v", err)
+	}
+	if tmpl.GetMetadata().GetUid() == "" {
+		t.Fatalf("expected ActorTemplate.Metadata.Uid to be populated")
+	}
+
+	_, err = client.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: "default", Name: "setup-actor"},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "ax-tmpl"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateActor(setup-actor) failed: %v", err)
+	}
+	if _, err := client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "setup-actor"},
+	}); err != nil {
+		t.Fatalf("ResumeActor(setup-actor) failed: %v", err)
+	}
+	if _, err := client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "setup-actor"},
+	}); err != nil {
+		t.Fatalf("SuspendActor(setup-actor) failed: %v", err)
+	}
+
+	tag, err := client.CreateTag(ctx, &ateapipb.CreateTagRequest{
+		Tag: &ateapipb.Tag{
+			Metadata:    &ateapipb.ResourceMetadata{Atespace: "default", Name: "ws-warm-tag"},
+			Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
+			SourceActor: &ateapipb.ObjectRef{Atespace: "default", Name: "setup-actor"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTag failed: %v", err)
+	}
+	if tag.GetStatus().GetActorTemplateUid() != tmpl.GetMetadata().GetUid() {
+		t.Errorf("Tag ActorTemplateUid = %q, want %q", tag.GetStatus().GetActorTemplateUid(), tmpl.GetMetadata().GetUid())
+	}
+	if tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetState() != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+		t.Errorf("Tag durable snapshot state = %v, want COMPLETED", tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetState())
+	}
+
+	// 2. Create a new actor seeded from source_tag (leaving it SUSPENDED), then connect via atenet-router!
+	_, err = client.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: "default", Name: "seeded-actor"},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "ax-tmpl"},
+			SourceTag:     &ateapipb.ObjectRef{Atespace: "default", Name: "ws-warm-tag"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateActor(seeded-actor) failed: %v", err)
+	}
+
+	// HTTP/1.1 /readyz via ate-target-actor wakes the suspended actor on demand and hydrates from ws-warm-tag.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+serverAddr+"/readyz?check=workspace", nil)
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	req.Header.Set("ate-target-actor", "default/seeded-actor")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("router HTTP /readyz failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("router /readyz status = %d, want 200", resp.StatusCode)
+	}
+
+	// HTTP/2 gRPC guest exec (ax ssh) via ate-target-actor through ate-local's built-in router.
+	gClient, err := guest.DialTarget(serverAddr, "default/seeded-actor")
+	if err != nil {
+		t.Fatalf("guest.DialTarget failed: %v", err)
+	}
+	defer gClient.Close()
+
+	var stdout, stderr bytes.Buffer
+	exitCode, err := gClient.Exec(ctx, guest.ExecOptions{
+		Command: []string{"echo", "router-exec-ok"},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+	})
+	if err != nil || exitCode != 0 {
+		t.Fatalf("gClient.Exec failed: exit=%d err=%v stderr=%s", exitCode, err, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "router-exec-ok" {
+		t.Errorf("gClient.Exec stdout = %q, want router-exec-ok", stdout.String())
+	}
+
+	// Verify DeleteTag cleans up cleanly.
+	if _, err := client.DeleteTag(ctx, &ateapipb.DeleteTagRequest{
+		Tag: &ateapipb.ObjectRef{Atespace: "default", Name: "ws-warm-tag"},
+	}); err != nil {
+		t.Fatalf("DeleteTag failed: %v", err)
 	}
 }
