@@ -15,10 +15,14 @@
 package atelocal
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -32,12 +36,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/ax/pkg/apis/v1alpha1"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"gopkg.in/yaml.v3"
 )
 
 func deterministicUUID(seed string) string {
@@ -56,6 +62,7 @@ type ActorRecord struct {
 	SourceTag          string
 	ContainerName      string
 	ContainerIP        string
+	WorkspaceHostDir   string
 	Port               int
 	State              ateapipb.ActorState
 	SnapshotGeneration int32
@@ -682,8 +689,11 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 			runArgs = append(runArgs, "-v", resolveVolumeSpec(vol))
 		}
 		if s.cfg.SnapshotDir != "" {
-			if wsHostDir, ok := s.stagePreBootWorkspace(actor, tmpl); ok {
+			if wsHostDir, ok := s.stagePreBootWorkspace(ctx, actor, tmpl); ok {
 				runArgs = append(runArgs, "-v", fmt.Sprintf("%s:/workspace", wsHostDir))
+				s.mu.Lock()
+				actor.WorkspaceHostDir = wsHostDir
+				s.mu.Unlock()
 				preMountedWorkspace = true
 			}
 		}
@@ -820,20 +830,116 @@ func (s *Server) tagSnapshotPath(atespace, tagName string) string {
 	return filepath.Join(s.cfg.SnapshotDir, sanitizeName(atespace), "tags", sanitizeName(tagName)+".tar.gz")
 }
 
-func (s *Server) saveWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) error {
-	out, err := s.runner.Run(ctx, "exec", actor.ContainerName, "sh", "-c", "test -d /workspace && tar -czf - -C /workspace . | base64 | tr -d '\\n\\r'")
+func (s *Server) actorWorkdirPath(atespace, actorName string) string {
+	if atespace == "" {
+		atespace = "default"
+	}
+	return filepath.Join(s.cfg.SnapshotDir, "workdirs", sanitizeName(s.cfg.ContainerPrefix), sanitizeName(atespace), sanitizeName(actorName))
+}
+
+func archiveDirTarGz(srcDir, dstPath string) (int64, error) {
+	info, err := os.Stat(srcDir)
+	if err != nil || !info.IsDir() {
+		return 0, fmt.Errorf("workspace host dir %q not available", srcDir)
+	}
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return 0, fmt.Errorf("creating snapshot directory: %w", err)
+	}
+	tmpPath := dstPath + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("creating temp snapshot file: %w", err)
 	}
-	encoded := strings.TrimSpace(out)
-	if encoded == "" {
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+
+	walkErr := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		var linkTarget string
+		if fi.Mode()&os.ModeSymlink != 0 {
+			linkTarget, _ = os.Readlink(path)
+		}
+		hdr, err := tar.FileInfoHeader(fi, linkTarget)
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if d.IsDir() && !strings.HasSuffix(hdr.Name, "/") {
+			hdr.Name += "/"
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if fi.Mode().IsRegular() {
+			rf, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(tw, rf)
+			_ = rf.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+		}
 		return nil
+	})
+	closeTwErr := tw.Close()
+	closeGzErr := gz.Close()
+	closeFileErr := f.Close()
+	if walkErr != nil {
+		_ = os.Remove(tmpPath)
+		return 0, walkErr
 	}
+	for _, cerr := range []error{closeTwErr, closeGzErr, closeFileErr} {
+		if cerr != nil {
+			_ = os.Remove(tmpPath)
+			return 0, cerr
+		}
+	}
+	st, err := os.Stat(tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, err
+	}
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, err
+	}
+	return st.Size(), nil
+}
+
+func (s *Server) saveWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) error {
+	path := s.snapshotPath(actor.Atespace, actor.Name)
+	s.mu.RLock()
+	wsHostDir := actor.WorkspaceHostDir
+	s.mu.RUnlock()
+
+	out, execErr := s.runner.Run(ctx, "exec", actor.ContainerName, "sh", "-c", "test -d /workspace && tar -czf - -C /workspace . | base64 | tr -d '\\n\\r'")
+	encoded := strings.TrimSpace(out)
+	if execErr != nil || encoded == "" {
+		if wsHostDir != "" {
+			if n, hostErr := archiveDirTarGz(wsHostDir, path); hostErr == nil {
+				slog.Info("saved workspace snapshot from staged host directory", "actor", resourceKey(actor.Atespace, actor.Name), "path", path, "bytes", n)
+				return nil
+			}
+		}
+		return execErr
+	}
+
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return fmt.Errorf("decoding workspace snapshot base64: %w", err)
 	}
-	path := s.snapshotPath(actor.Atespace, actor.Name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating snapshot directory: %w", err)
 	}
@@ -855,12 +961,13 @@ var wsNameFromYAMLRe = regexp.MustCompile(`(?m)^\s*name:\s*["']?([a-zA-Z0-9._-]+
 // /workspace is populated at T=0 before PID 1 (`ax-task-runner`) starts.
 // Returns ("", false) when no valid tar.gz archive exists (falling back to
 // post-boot restoreWorkspaceSnapshot).
-func (s *Server) stagePreBootWorkspace(actor *ActorRecord, tmpl TemplateConfig) (string, bool) {
+func (s *Server) stagePreBootWorkspace(ctx context.Context, actor *ActorRecord, tmpl TemplateConfig) (string, bool) {
 	candidates := []string{s.snapshotPath(actor.Atespace, actor.Name)}
 	if actor.SourceTag != "" {
 		candidates = append(candidates, s.tagSnapshotPath(actor.Atespace, actor.SourceTag))
 	}
-	if wsYAML := tmpl.Env["AX_WORKSPACE_YAML"]; wsYAML != "" {
+	wsYAML := tmpl.Env["AX_WORKSPACE_YAML"]
+	if wsYAML != "" {
 		if m := wsNameFromYAMLRe.FindStringSubmatch(wsYAML); len(m) == 2 {
 			candidates = append(candidates, s.tagSnapshotPath(actor.Atespace, m[1]+"-warm"))
 		}
@@ -876,15 +983,16 @@ func (s *Server) stagePreBootWorkspace(actor *ActorRecord, tmpl TemplateConfig) 
 			break
 		}
 	}
+	if snapPath == "" && wsYAML != "" {
+		if prewarmed, ok := s.ensureWarmWorkspaceTag(ctx, actor, wsYAML); ok {
+			snapPath = prewarmed
+		}
+	}
 	if snapPath == "" {
 		return "", false
 	}
 
-	atespace := actor.Atespace
-	if atespace == "" {
-		atespace = "default"
-	}
-	hostDir := filepath.Join(s.cfg.SnapshotDir, "workdirs", sanitizeName(s.cfg.ContainerPrefix), sanitizeName(atespace), sanitizeName(actor.Name))
+	hostDir := s.actorWorkdirPath(actor.Atespace, actor.Name)
 	_ = os.RemoveAll(hostDir)
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
 		return "", false
@@ -895,6 +1003,158 @@ func (s *Server) stagePreBootWorkspace(actor *ActorRecord, tmpl TemplateConfig) 
 	}
 	slog.Info("pre-staged workspace snapshot before container boot", "actor", resourceKey(actor.Atespace, actor.Name), "snapshot", snapPath, "hostDir", hostDir)
 	return hostDir, true
+}
+
+func workspaceNeedsSetup(ws *v1alpha1.Workspace) bool {
+	setup := ws.GetSpec().GetSetup()
+	if setup == nil {
+		return false
+	}
+	return len(setup.GetGit()) > 0 || len(setup.GetFiles()) > 0 || setup.GetSkills() != nil || len(setup.GetCommands()) > 0
+}
+
+func (s *Server) findRunnerHostBinary(tmpl TemplateConfig) string {
+	for _, tc := range []TemplateConfig{tmpl, s.resolveTemplate("default", "default")} {
+		for _, vol := range tc.Volumes {
+			resolved := resolveVolumeSpec(vol)
+			parts := strings.SplitN(resolved, ":", 2)
+			if len(parts) == 2 && parts[1] == "/usr/local/bin/ax-task-runner" {
+				if st, err := os.Stat(parts[0]); err == nil && !st.IsDir() {
+					return parts[0]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// ensureWarmWorkspaceTag runs a short-lived setup container (using SetupImage,
+// e.g. alpine/git) when a task binds a Workspace with non-empty spec.setup and
+// no warm <ws>-warm Tag snapshot exists yet.
+func (s *Server) ensureWarmWorkspaceTag(ctx context.Context, actor *ActorRecord, wsYAML string) (string, bool) {
+	if s.cfg.SetupImage == "" || s.cfg.SetupImage == "none" {
+		return "", false
+	}
+	var ws v1alpha1.Workspace
+	if err := yaml.Unmarshal([]byte(wsYAML), &ws); err != nil || !workspaceNeedsSetup(&ws) {
+		return "", false
+	}
+	wsName := ws.GetMetadata().GetName()
+	if wsName == "" {
+		return "", false
+	}
+	atespace := actor.Atespace
+	if atespace == "" {
+		atespace = "default"
+	}
+	runnerBin := s.findRunnerHostBinary(s.resolveTemplate(atespace, actor.TemplateName))
+	if runnerBin == "" {
+		return "", false
+	}
+
+	tagName := wsName + "-warm"
+	tagSnap := s.tagSnapshotPath(atespace, tagName)
+
+	setupImage := ws.GetSpec().GetProfile().GetImage()
+	if setupImage == "" {
+		setupImage = s.cfg.SetupImage
+	}
+
+	stageDir, err := os.MkdirTemp(s.cfg.SnapshotDir, "ws-prewarm-*")
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = os.RemoveAll(stageDir) }()
+
+	setupName := fmt.Sprintf("%s-setup-%s-%d", sanitizeName(s.cfg.ContainerPrefix), sanitizeName(wsName), time.Now().UnixNano()%100000)
+	if len(setupName) > 48 {
+		setupName = setupName[:48]
+	}
+	setupTaskYAML := fmt.Sprintf("apiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: %s\n  atespace: %s\nspec:\n  workspace:\n    name: %s\n  commands:\n    - \"true\"\n", setupName, atespace, wsName)
+
+	runArgs := []string{
+		"run", "--progress", "none", "-d",
+		"--name", setupName,
+		"--entrypoint", "/usr/local/bin/ax-task-runner",
+		"-v", runnerBin + ":/usr/local/bin/ax-task-runner",
+		"-v", stageDir + ":/workspace",
+		"-e", "AX_WORKSPACE_YAML=" + wsYAML,
+		"-e", "AX_TASK_YAML=" + setupTaskYAML,
+	}
+	if s.cfg.InitImage != "" {
+		runArgs = append(runArgs, "--init-image", s.cfg.InitImage)
+	}
+	runArgs = append(runArgs, setupImage)
+
+	slog.Info("auto-prewarming workspace snapshot tag", "workspace", resourceKey(atespace, wsName), "tag", tagName, "setupImage", setupImage)
+	if _, err := s.runner.Run(ctx, runArgs...); err != nil {
+		slog.Warn("workspace auto-prewarm container failed to launch", "workspace", wsName, "error", err)
+		return "", false
+	}
+	defer func() {
+		_, _ = s.runner.Run(context.Background(), "delete", "--force", setupName)
+	}()
+
+	deadline := time.Now().Add(s.cfg.ReadyTimeout)
+	initialized := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(stageDir, ".ax", "initialized")); err == nil {
+			initialized = true
+			break
+		}
+		if _, err := os.Stat(filepath.Join(stageDir, ".git", ".ax", "initialized")); err == nil {
+			initialized = true
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", false
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	_, _ = s.runner.Run(ctx, "stop", "--time", "1", setupName)
+	if !initialized {
+		slog.Warn("workspace auto-prewarm timed out waiting for .ax/initialized", "workspace", wsName)
+		return "", false
+	}
+
+	if _, err := archiveDirTarGz(stageDir, tagSnap); err != nil {
+		slog.Warn("archiving auto-prewarmed workspace failed", "workspace", wsName, "error", err)
+		return "", false
+	}
+
+	now := timestamppb.Now()
+	tagKey := resourceKey(atespace, tagName)
+	tmplUID := actor.TemplateUID
+	tag := &ateapipb.Tag{
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace:   atespace,
+			Name:       tagName,
+			Uid:        deterministicUUID("tag/" + tagKey),
+			CreateTime: now,
+			UpdateTime: now,
+		},
+		Scope: ateapipb.TagScope_TAG_SCOPE_ATESPACE,
+		Status: &ateapipb.TagStatus{
+			ActorTemplateUid: tmplUID,
+			Snapshot: &ateapipb.Snapshot{
+				Uuid:             "snap-" + sanitizeName(tagName),
+				Generation:       1,
+				Owner:            ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG,
+				Fidelity:         ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+				ActorTemplateUid: tmplUID,
+				DurableSnapshot: &ateapipb.SnapshotStorage{
+					State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+				},
+			},
+		},
+	}
+	s.mu.Lock()
+	s.tags[tagKey] = tag
+	s.mu.Unlock()
+
+	slog.Info("minted warm workspace snapshot tag", "workspace", wsName, "tag", tagKey, "path", tagSnap)
+	return tagSnap, true
 }
 
 func (s *Server) restoreWorkspaceSnapshot(ctx context.Context, actor *ActorRecord) error {
@@ -1012,6 +1272,10 @@ func (s *Server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorReque
 	}
 
 	_, _ = s.runner.Run(ctx, "delete", "--force", actor.ContainerName)
+	if s.cfg.SnapshotDir != "" {
+		_ = os.RemoveAll(s.actorWorkdirPath(actor.Atespace, actor.Name))
+		_ = os.Remove(s.snapshotPath(actor.Atespace, actor.Name))
+	}
 
 	return actor.toProto(), nil
 }

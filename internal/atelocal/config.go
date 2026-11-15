@@ -43,6 +43,7 @@ type Config struct {
 	Address         string                    `yaml:"address"`                    // gRPC listen address (default ":50051")
 	Runtime         string                    `yaml:"runtime,omitempty"`          // Container runtime: "apple" (default) or "podman"
 	SnapshotDir     string                    `yaml:"snapshot_dir,omitempty"`     // Optional directory to save/restore /workspace snapshots across Suspend/Resume
+	SetupImage      string                    `yaml:"setup_image,omitempty"`      // Image with git+/bin/sh used for lazy warm Workspace setup (default "alpine/git")
 	ContainerPrefix string                    `yaml:"container_prefix,omitempty"` // Container name prefix (default "ate")
 	DefaultTemplate string                    `yaml:"default_template,omitempty"`
 	InitImage       string                    `yaml:"init_image,omitempty"` // Optional custom Apple container vminit image
@@ -97,6 +98,13 @@ func (c *Config) setDefaults() {
 	}
 	if c.SnapshotDir == "" {
 		c.SnapshotDir = os.Getenv("ATE_LOCAL_SNAPSHOT_DIR")
+	}
+	if c.SetupImage == "" {
+		if envSetupImg := os.Getenv("ATE_LOCAL_SETUP_IMAGE"); envSetupImg != "" {
+			c.SetupImage = envSetupImg
+		} else {
+			c.SetupImage = "alpine/git"
+		}
 	}
 	if c.ContainerPrefix == "" {
 		c.ContainerPrefix = "ate"

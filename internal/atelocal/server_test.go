@@ -786,6 +786,7 @@ type mockRunner struct {
 	runCalls   [][]string
 	inspectMap map[string]*ContainerInspectResult
 	runErr     error
+	execErr    error
 	inspectErr error
 	created    map[string]bool
 	execOutput string
@@ -808,8 +809,13 @@ func (m *mockRunner) Run(ctx context.Context, args ...string) (string, error) {
 	if m.runErr != nil {
 		return "", m.runErr
 	}
-	if len(args) > 0 && args[0] == "exec" && m.execOutput != "" {
-		return m.execOutput, nil
+	if len(args) > 0 && args[0] == "exec" {
+		if m.execErr != nil {
+			return "", m.execErr
+		}
+		if m.execOutput != "" {
+			return m.execOutput, nil
+		}
 	}
 	return "ok", nil
 }
@@ -1224,5 +1230,111 @@ func TestTagAndRouterProxy(t *testing.T) {
 		Tag: &ateapipb.ObjectRef{Atespace: "default", Name: "ws-warm-tag"},
 	}); err != nil {
 		t.Fatalf("DeleteTag failed: %v", err)
+	}
+}
+
+func TestPreBootWorkspaceStagingAndDeleteCleanup(t *testing.T) {
+	ctx := t.Context()
+	snapshotDir := t.TempDir()
+
+	// Build a real gzip-compressed tar archive representing tags/hero-demo-ws-warm.tar.gz.
+	seedSrc := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(seedSrc, ".ax"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seedSrc, ".ax", "initialized"), []byte("hero-demo-ws\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(seedSrc, "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seedSrc, "app", "math_utils.py"), []byte("def add(a, b):\n    return a + b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	warmTagSnap := filepath.Join(snapshotDir, "default", "tags", "hero-demo-ws-warm.tar.gz")
+	if _, err := archiveDirTarGz(seedSrc, warmTagSnap); err != nil {
+		t.Fatalf("archiveDirTarGz failed: %v", err)
+	}
+
+	// Simulate an exited batch container where `exec` fails during SuspendActor so
+	// saveWorkspaceSnapshot falls back to archiving the pre-mounted host workdir.
+	runner := &mockRunner{
+		created: make(map[string]bool),
+		execErr: fmt.Errorf("container exited"),
+	}
+	cfg := DefaultConfig()
+	cfg.ContainerPrefix = "ate-apple"
+	cfg.SnapshotDir = snapshotDir
+	cfg.ReadyTimeout = 100 * time.Millisecond
+	cfg.Runner = runner
+
+	client, cleanup := startTestControlServer(t, cfg)
+	defer cleanup()
+
+	wsYAML := "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: hero-demo-ws\n  atespace: default\n"
+	if _, err := client.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{
+		ActorTemplate: &ateapipb.ActorTemplate{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: "default", Name: "custom-tmpl"},
+			Containers: []*ateapipb.Container{{
+				Name:    "guest",
+				Image:   "python:3.12-slim",
+				Command: []string{"sleep", "infinity"},
+				Env:     []*ateapipb.EnvVar{{Name: "AX_WORKSPACE_YAML", Value: wsYAML}},
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateActorTemplate failed: %v", err)
+	}
+
+	if _, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: "default", Name: "custom-task"},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "custom-tmpl"},
+		},
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	if _, err := client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "custom-task"},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+
+	// Verify stagePreBootWorkspace extracted math_utils.py and .ax/initialized before `run` and mounted -v <hostDir>:/workspace.
+	wantWorkdir := filepath.Join(snapshotDir, "workdirs", "ate-apple", "default", "custom-task")
+	if _, err := os.Stat(filepath.Join(wantWorkdir, ".ax", "initialized")); err != nil {
+		t.Fatalf("expected pre-staged .ax/initialized in %s: %v", wantWorkdir, err)
+	}
+	if err := os.WriteFile(filepath.Join(wantWorkdir, "app", "output.txt"), []byte("batch-ok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// SuspendActor should archive wantWorkdir via host-dir fallback even though mockRunner.execErr is set.
+	if _, err := client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "custom-task"},
+	}); err != nil {
+		t.Fatalf("SuspendActor failed: %v", err)
+	}
+	actorSnap := filepath.Join(snapshotDir, "default", "custom-task.tar.gz")
+	if st, err := os.Stat(actorSnap); err != nil || st.Size() == 0 {
+		t.Fatalf("expected non-empty actor snapshot %s from host fallback, err=%v", actorSnap, err)
+	}
+
+	// DeleteActor should clean up both wantWorkdir and actorSnap while preserving warmTagSnap!
+	if _, err := client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "custom-task"},
+	}); err != nil {
+		t.Fatalf("DeleteActor failed: %v", err)
+	}
+	if _, err := os.Stat(wantWorkdir); !os.IsNotExist(err) {
+		t.Errorf("expected DeleteActor to remove staged workdir %s, got err=%v", wantWorkdir, err)
+	}
+	if _, err := os.Stat(actorSnap); !os.IsNotExist(err) {
+		t.Errorf("expected DeleteActor to remove actor snapshot %s, got err=%v", actorSnap, err)
+	}
+	if _, err := os.Stat(warmTagSnap); err != nil {
+		t.Errorf("expected DeleteActor to preserve tag snapshot %s, got err=%v", warmTagSnap, err)
 	}
 }
