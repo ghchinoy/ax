@@ -148,6 +148,7 @@ Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It appli
 | [Observability](docs/observability.md) | Collect ax-server's logs, metrics, traces, and events, and configure where they go. |
 | [Architecture](DESIGN.md) | Understand how the control plane fits together, plus the [API reference](DESIGN.md#api-reference). |
 | [Development](docs/development.md) | Build, test, and ship changes to AX itself. |
+| [Local Substrate (`ate-local`)](docs/ate-local.md) | Run AX locally on Apple `container` or Podman without Kubernetes, and migrate tasks across clusters. |
 | [Roadmap](docs/roadmap.md) | See planned milestones across core specs, actor architecture, agentic environments, and governance. |
 
 ## CLI usage

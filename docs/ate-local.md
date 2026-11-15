@@ -4,6 +4,8 @@
 
 It allows `ax-server`, `TaskReconciler`, and the `ax` CLI to provision, resume, inspect (`ax ssh`), suspend, and migrate real Linux sandboxed tasks locally on a developer machine without requiring a Kubernetes cluster (`kind` or GKE), gVisor, Envoy (`atenet-router`), or Google Cloud Storage.
 
+> **Upstream Tracking Issue:** [google/ax#602](https://github.com/google/ax/issues/602)
+
 ---
 
 ## 1. Motivation & Upstream Alignment
@@ -16,6 +18,7 @@ Running AX against a full Agent Substrate installation requires Kubernetes 1.36+
 
 | Upstream Issue / PR | Relationship to `ate-local` |
 |---|---|
+| **[#602](https://github.com/google/ax/issues/602) (`ate-local` Proposal)** | Primary tracking issue and stacked PR breakdown for `ate-local`. |
 | **[#526](https://github.com/google/ax/issues/526) (Local development)**, **[#543](https://github.com/google/ax/issues/543) (AX Studio)**, **[PR #560](https://github.com/google/ax/pull/560) (Roadmap)** & **[PR #590](https://github.com/google/ax/pull/590) (`hack/hero-demo`)** | Directly addresses the roadmap goal *"Install and run AX locally without having to set up container tooling or a Kubernetes cluster"* (#560), AX Studio's zero-K8s laptop cluster workflow (#543), and Steps 1 & 5 of the v0.1 Hero Demo harness (#590). |
 | **[PR #558](https://github.com/google/ax/pull/558) (`ax local` on Kind POC)** | Complementary tier: PR #558 provisions full Kubernetes + Substrate inside `kind` (requiring Docker/Podman, a $\ge 6.8$ host kernel, and ~5.4k lines of embedded manifests). `ate-local` implements `ateapi/v1.ControlServer` + `atenet-router` directly in Go under `internal/atelocal` with sub-second task startup on macOS. |
 | **[Epic #563](https://github.com/google/ax/issues/563): `Profile` ([#586](https://github.com/google/ax/pull/586)), `Task` ([#587](https://github.com/google/ax/pull/587)), `Gateway` ([#585](https://github.com/google/ax/pull/585)), & Warm `Workspace` `Tag`s ([#584](https://github.com/google/ax/issues/584) / [#592](https://github.com/google/ax/pull/592))** | Supports `TaskSpec.profile` (`image`, `resources`, `ateActorTemplate`), `Gateway` egress policy binding (`default` `EgressPolicy`), snapshot `Tag` CRUD (`CreateTag`, `GetTag`, `ListTags`, `DeleteTag`) + `CreateActor(source_tag)`, and `ATENET_ROUTER_ADDR` routing for `ax ssh` after #587 removed `TaskStatus.worker_ip`. |
@@ -62,21 +65,22 @@ Running AX against a full Agent Substrate installation requires Kubernetes 1.36+
 The single-cluster local stack runs:
 
 ```
-ax CLI ──gRPC (:8090)──> ax-server ──Control gRPC (:50051)──> ate-local ──> Apple container
-                             │
-                             └──> PostgreSQL (:5432, resource store & locks)
+ax CLI ──gRPC (:8090)──────────> ax-server ──Control gRPC (:50051)──> ate-local ──> Apple container
+  │                                  │                                    ▲
+  │                                  └──> PostgreSQL (:5432, store/locks) │
+  └─ATENET_ROUTER_ADDR (:50051)───────────ate-target-actor (h2c / HTTP)───┘
 ```
 
 Start the stack with `make local-up` (or `./examples/ate_local/local-stack.sh up`):
 
 ```bash
 make local-up                       # starts PostgreSQL, ate-local, and ax-server in order
-source .ax-local/env                # sets AX_SERVER=localhost:8090 and adds .ax-local/bin to PATH
+source .ax-local/env                # sets AX_SERVER=localhost:8090, ATENET_ROUTER_ADDR=127.0.0.1:50051, and PATH
 
 ax apply -f examples/ate_local/task-local.yaml
-ax resume local-task                # Tasks are created in Suspended phase
-ax describe task local-task         # Phase: Running, Ready: True, Worker IP: 192.168.64.x
-ax ssh local-task -- uname -sm      # executes inside the Linux arm64 sandbox
+ax resume local-task                # Tasks are created in Suspended state
+ax describe task local-task         # State: Working, Actor: local-task, Actor UID: ..., Ready: True
+ax ssh local-task -- uname -sm      # executes inside the Linux arm64 sandbox via ATENET_ROUTER_ADDR
 ax delete task local-task
 
 make local-down
@@ -176,11 +180,11 @@ All `ate-local` code is isolated from core AX packages so it adds zero maintenan
 
 | Path | Purpose |
 |---|---|
-| `cmd/ate-local/main.go` | CLI entrypoint for the local Substrate Control gRPC daemon (`--config`, `--addr`, `--runtime`, `--snapshot-dir`, `--container-prefix`). |
+| `cmd/ate-local/main.go` | CLI entrypoint for the local Substrate Control + `atenet-router` HTTP/2 (`h2c`) daemon (`--config`, `--addr`, `--runtime`, `--snapshot-dir`, `--container-prefix`). |
 | `internal/atelocal/config.go` | YAML configuration loader and defaults (`runtime`, `snapshot_dir`, `container_prefix`, `templates`). |
 | `internal/atelocal/runner.go` | `ContainerRunner` interface with `apple` (`/usr/local/bin/container`) and `podman` (`podman`) implementations, CLI flag translation, and `inspect` JSON parsers. |
-| `internal/atelocal/server.go` | In-memory `ateapi/v1.ControlServer` implementation, per-task `ActorTemplate` resource mapping, and `/workspace` `.tar.gz` snapshot save/restore. |
-| `internal/atelocal/server_test.go` | Unit tests for `ControlServer` RPCs, `PodmanRunner` CLI/inspect translation, cross-cluster `apple` $\rightarrow$ `podman` snapshot migration, and opt-in live Apple `container` reconciler + `ax ssh` integration tests. |
+| `internal/atelocal/server.go` | In-memory `ateapi/v1.ControlServer` implementation, embedded `atenet-router` (`Handler` / `NewHTTPServer` with wake-on-request), `Tag` CRUD + `source_tag` seeding, `ActorTemplate` resource mapping, and `/workspace` `.tar.gz` snapshot save/restore. |
+| `internal/atelocal/server_test.go` | Unit tests for `ControlServer` RPCs, `Gateway` egress binding, `Tag` + `atenet-router` proxy (`TestTagAndRouterProxy`), `PodmanRunner` CLI/inspect translation, cross-cluster `apple` $\rightarrow$ `podman` snapshot migration, and opt-in live Apple `container` reconciler + `ax ssh` integration tests. |
 | `examples/ate_local/local-stack.sh` | Single-cluster (`up`/`down`) and dual-cluster (`multi-up`/`multi-down`/`migrate`) orchestration script. |
 | `docs/ate-local.md` | Canonical architecture, upstream alignment, and operations documentation. |
 
@@ -194,8 +198,9 @@ All `ate-local` code is isolated from core AX packages so it adds zero maintenan
 |---|---|
 | `opening store ... dial tcp [::1]:5432: connect: connection refused` | PostgreSQL isn't running, or `localhost` resolved to IPv6. Start PostgreSQL and use `127.0.0.1:5432`. |
 | `http2: frame too large, note that the frame header looked like an HTTP/1.1 header` | `ax` reached a non-gRPC server. Without `--server` or `AX_SERVER`, `ax` connects to `localhost:8080`, which is often used by other tools. Run `source .ax-local/env`. |
-| Task `Pending` with `SubstrateUnavailable` | `ate-local` wasn't running or was temporarily unreachable when `ax-server` reconciled. Start `ate-local`; `ax-server` retries transient errors with backoff. |
-| Task never becomes `Running` | Tasks start `Suspended`; run `ax resume <name>`. |
+| Task creation or resume fails with `SubstrateUnavailable` | `ate-local` wasn't running or was temporarily unreachable when `ax-server` reconciled. Start `ate-local`; `ax-server` retries transient errors with backoff. |
+| Task stays `Suspended` (never reaches `Working`) | Tasks start `Suspended`; run `ax resume <name>`. |
+| `ax ssh` attempts `kubectl` port-forward to `ate-system` | `ATENET_ROUTER_ADDR` is unset in your shell. Run `source .ax-local/env` (or pass `ATENET_ROUTER_ADDR=127.0.0.1:50051`). |
 | Actor container fails to start with the upstream `ax-task-runner` image | That image is `linux/amd64`. Use `examples/ate_local/task-local.yaml`, which runs `debian:12` with the `linux/arm64` runner binary that `local-stack.sh` builds and mounts into `/usr/local/bin/ax-task-runner`. |
 
 ### Limitations
