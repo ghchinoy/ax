@@ -49,6 +49,7 @@ elif command -v podman >/dev/null 2>&1; then
 else
   CLUSTER_B_RUNTIME="apple"
 fi
+HOST="127.0.0.1"
 POSTGRES_PORT="${AX_LOCAL_POSTGRES_PORT:-5432}"
 SUBSTRATE_PORT="${AX_LOCAL_SUBSTRATE_PORT:-50051}"
 SERVER_PORT="${AX_LOCAL_SERVER_PORT:-8090}"
@@ -78,7 +79,6 @@ SNAPSHOT_DIR="${STATE_DIR}/snapshots"
 CONFIG_FILE="${STATE_DIR}/ate-local.yaml"
 CONFIG_B_FILE="${STATE_DIR}/ate-local-b.yaml"
 ENV_FILE="${STATE_DIR}/env"
-HOST="127.0.0.1"
 WAIT_SECONDS=30
 
 # Processes this script manages, in start order.
