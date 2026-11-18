@@ -42,24 +42,34 @@ CLAUDE_CODE_REPO ?= gcr.io/ax-images/ax-images
 CLAUDE_CODE_VERSION ?= latest
 CLAUDE_CODE_BASE_IMAGE ?=
 
-# Prefer podman, fall back to docker.
-CONTAINER_CLI ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+# Prefer container on macOS, then podman, fall back to docker.
+CONTAINER_CLI ?= $(shell command -v container 2>/dev/null || command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 
 BUF := go tool -modfile=hack/tools/buf/go.mod buf
 GOLANGCI_LINT := go tool -modfile=hack/tools/golangci-lint/go.mod golangci-lint
 
-.PHONY: build install images push-runner-volume check-image-repo build-claude-code-image push-claude-code-image generate deploy deploy-server deploy-postgres apply-example verify test test-e2e e2e-setup e2e-run e2e-cleanup clean
+.PHONY: build install images push-runner-volume check-image-repo build-claude-code-image push-claude-code-image generate deploy deploy-server deploy-postgres apply-example verify test test-e2e e2e-setup e2e-run e2e-cleanup clean build-ate-local run-ate-local
 
 ## --------------------------------------
 ## Build Targets
 ## --------------------------------------
 
-# Build all local binaries (ax CLI, server)
+# Build all local binaries (ax CLI, server, ate-local)
 build:
-	@echo "==> Building local binaries (ax, ax-server)..."
+	@echo "==> Building local binaries (ax, ax-server, ate-local)..."
 	@mkdir -p bin
 	go build -trimpath -ldflags="-s -w" -o bin/ax ./cmd/ax
 	go build -trimpath -ldflags="-s -w" -o bin/ax-server ./cmd/ax-server
+	go build -trimpath -ldflags="-s -w" -o bin/ate-local ./cmd/ate-local
+
+build-ate-local:
+	@echo "==> Building ate-local..."
+	@mkdir -p bin
+	go build -trimpath -ldflags="-s -w" -o bin/ate-local ./cmd/ate-local
+
+run-ate-local: build-ate-local
+	@echo "==> Running ate-local daemon..."
+	./bin/ate-local --config examples/ate_local/ate-local.yaml
 
 # Install the ax CLI into $(go env GOPATH)/bin
 install:
