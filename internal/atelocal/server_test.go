@@ -1338,3 +1338,67 @@ func TestPreBootWorkspaceStagingAndDeleteCleanup(t *testing.T) {
 		t.Errorf("expected DeleteActor to preserve tag snapshot %s, got err=%v", warmTagSnap, err)
 	}
 }
+
+func TestControlServer_RunnerVolumeMount(t *testing.T) {
+	ctx := t.Context()
+	runner := &mockRunner{created: make(map[string]bool)}
+	cfg := DefaultConfig()
+	cfg.ReadyTimeout = 50 * time.Millisecond
+	cfg.Runner = runner
+	hostRunner := filepath.Join(t.TempDir(), "ax-task-runner")
+	cfg.Templates["default"] = TemplateConfig{
+		Atespace: "default",
+		Name:     "default",
+		Image:    "debian:12",
+		Port:     80,
+		Volumes:  []string{hostRunner + ":/usr/local/bin/ax-task-runner"},
+	}
+
+	client, cleanup := startTestControlServer(t, cfg)
+	defer cleanup()
+
+	tmpl := substrate.BuildActorTemplate("default", "opt-runner-tmpl", "python:3.12-slim", nil, nil, "", nil)
+	substrate.MountRunnerVolume(tmpl, "ghcr.io/google/ax/ax-runner-volume@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+	if _, err := client.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{ActorTemplate: tmpl}); err != nil {
+		t.Fatalf("CreateActorTemplate failed: %v", err)
+	}
+	if _, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: "default", Name: "opt-runner-task"},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "opt-runner-tmpl"},
+		},
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: "default", Name: "opt-runner-task"},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+
+	wantMount := hostRunner + ":" + v1alpha1.RunnerMountPath + "/ax-task-runner"
+	wantCmd := v1alpha1.RunnerMountPath + "/ax-task-runner"
+	foundMount := false
+	foundCmd := false
+	runner.mu.Lock()
+	calls := append([][]string(nil), runner.runCalls...)
+	runner.mu.Unlock()
+	for _, args := range calls {
+		if len(args) > 0 && args[0] == "run" {
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, wantMount) {
+				foundMount = true
+			}
+			if strings.Contains(joined, wantCmd) {
+				foundCmd = true
+			}
+		}
+	}
+	if !foundMount {
+		t.Errorf("expected container run args to bind-mount %q, got calls: %v", wantMount, calls)
+	}
+	if !foundCmd {
+		t.Errorf("expected container run args to execute %q, got calls: %v", wantCmd, calls)
+	}
+}

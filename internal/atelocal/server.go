@@ -351,6 +351,7 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 		CPUs:      defaultTC.CPUs,
 		Memory:    defaultTC.Memory,
 	}
+	mountsOptRunner := false
 	if len(tmpl.GetContainers()) > 0 {
 		c := tmpl.GetContainers()[0]
 		tc.Image = c.GetImage()
@@ -363,6 +364,16 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 		}
 		if c.GetWakeupProbe() != nil && c.GetWakeupProbe().GetHttpGet() != nil && c.GetWakeupProbe().GetHttpGet().GetPort() > 0 {
 			tc.Port = int(c.GetWakeupProbe().GetHttpGet().GetPort())
+		}
+		optRunnerBin := v1alpha1.RunnerMountPath + "/ax-task-runner"
+		if len(c.GetCommand()) > 0 && c.GetCommand()[0] == optRunnerBin {
+			mountsOptRunner = true
+		}
+		for _, vm := range c.GetVolumeMounts() {
+			if vm.GetMountPath() == v1alpha1.RunnerMountPath {
+				mountsOptRunner = true
+				break
+			}
 		}
 	}
 	if limits := tmpl.GetResources().GetLimits(); limits != nil {
@@ -384,6 +395,18 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 	if tc.Image == "" {
 		tc.Image = "debian:12"
 	}
+	// When ax-server is configured with --runner-volume-image (#620), templates
+	// mount the read-only runner volume at v1alpha1.RunnerMountPath (/opt/ax)
+	// and execute /opt/ax/ax-task-runner. Mirror the configured host runner
+	// binary onto /opt/ax/ax-task-runner as well so stock and pure agent images
+	// run locally without pulling a registry image volume.
+	var hostRunnerSrc string
+	for _, v := range defaultTC.Volumes {
+		if strings.HasSuffix(v, ":/usr/local/bin/ax-task-runner") {
+			hostRunnerSrc = strings.TrimSuffix(v, ":/usr/local/bin/ax-task-runner")
+			break
+		}
+	}
 	// Images in */ax-images/* (such as ghcr.io/ghchinoy/ax-images/* and
 	// ghcr.io/rakyll/ax-images/*) already ship a multi-arch linux/arm64
 	// /usr/local/bin/ax-task-runner (linked to /usr/local/bin/ax-agent). Skip
@@ -396,6 +419,19 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 			}
 		}
 		tc.Volumes = filtered
+	}
+	if mountsOptRunner && hostRunnerSrc != "" {
+		optMount := hostRunnerSrc + ":" + v1alpha1.RunnerMountPath + "/ax-task-runner"
+		hasOptMount := false
+		for _, v := range tc.Volumes {
+			if v == optMount {
+				hasOptMount = true
+				break
+			}
+		}
+		if !hasOptMount {
+			tc.Volumes = append(tc.Volumes, optMount)
+		}
 	}
 
 	tmplUID := tmpl.GetMetadata().GetUid()
