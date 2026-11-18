@@ -39,7 +39,10 @@ type TemplateConfig struct {
 
 // Config configures the local Substrate Control server.
 type Config struct {
-	Address         string                    `yaml:"address"` // gRPC listen address (default ":50051")
+	Address         string                    `yaml:"address"`                    // gRPC listen address (default ":50051")
+	Runtime         string                    `yaml:"runtime,omitempty"`          // Container runtime: "apple" (default) or "podman"
+	SnapshotDir     string                    `yaml:"snapshot_dir,omitempty"`     // Optional directory to save/restore /workspace snapshots across Suspend/Resume
+	ContainerPrefix string                    `yaml:"container_prefix,omitempty"` // Container name prefix (default "ate")
 	DefaultTemplate string                    `yaml:"default_template,omitempty"`
 	InitImage       string                    `yaml:"init_image,omitempty"` // Optional custom Apple container vminit image
 	Templates       map[string]TemplateConfig `yaml:"templates,omitempty"`
@@ -83,6 +86,19 @@ func DefaultConfig() *Config {
 func (c *Config) setDefaults() {
 	if c.Address == "" {
 		c.Address = ":50051"
+	}
+	if c.Runtime == "" {
+		if envRuntime := os.Getenv("ATE_LOCAL_RUNTIME"); envRuntime != "" {
+			c.Runtime = envRuntime
+		} else {
+			c.Runtime = RuntimeApple
+		}
+	}
+	if c.SnapshotDir == "" {
+		c.SnapshotDir = os.Getenv("ATE_LOCAL_SNAPSHOT_DIR")
+	}
+	if c.ContainerPrefix == "" {
+		c.ContainerPrefix = "ate"
 	}
 	if c.ReadyTimeout == 0 {
 		c.ReadyTimeout = 20 * time.Second

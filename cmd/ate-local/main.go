@@ -38,7 +38,10 @@ func main() {
 
 	configFile := flag.String("config", "", "Path to ate-local.yaml configuration file (optional)")
 	addr := flag.String("addr", ":50051", "gRPC server listen address")
-	containerBin := flag.String("container-bin", "", "Path to Apple container CLI binary (optional)")
+	runtime := flag.String("runtime", "", "Container runtime: apple (default) or podman")
+	snapshotDir := flag.String("snapshot-dir", "", "Directory to save/restore actor /workspace snapshots across Suspend/Resume (optional)")
+	containerPrefix := flag.String("container-prefix", "", "Container name prefix (default: ate)")
+	containerBin := flag.String("container-bin", "", "Path to container CLI binary (optional)")
 	initImage := flag.String("init-image", "", "Custom Apple container vminit image (optional, auto-detected on version mismatch)")
 	flag.Parse()
 
@@ -50,6 +53,15 @@ func main() {
 
 	if *addr != "" && *addr != ":50051" {
 		cfg.Address = *addr
+	}
+	if *runtime != "" {
+		cfg.Runtime = *runtime
+	}
+	if *snapshotDir != "" {
+		cfg.SnapshotDir = *snapshotDir
+	}
+	if *containerPrefix != "" {
+		cfg.ContainerPrefix = *containerPrefix
 	}
 	if *containerBin != "" {
 		cfg.BinaryPath = *containerBin
@@ -87,7 +99,12 @@ func main() {
 		_ = server.Close(shutdownCtx)
 	}()
 
-	slog.Info("ate-local Substrate Control server listening", "address", lis.Addr().String(), "runtime", "apple-container")
+	slog.Info("ate-local Substrate Control server listening",
+		"address", lis.Addr().String(),
+		"runtime", cfg.Runtime,
+		"containerPrefix", cfg.ContainerPrefix,
+		"snapshotDir", cfg.SnapshotDir,
+	)
 	if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
 		slog.Error("server failed", "error", err)
 		os.Exit(1)

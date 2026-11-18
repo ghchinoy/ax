@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for ate-local (Local Substrate Control Daemon backed by Apple Container)
+# Configuration for ate-local (Local Substrate Control Daemon backed by Apple Container or Podman)
 address: "127.0.0.1:50051"
+runtime: "apple"            # "apple" (default) or "podman"
+container_prefix: "ate"     # Prefix for actor container names
+snapshot_dir: ""            # Optional shared directory for saving/restoring /workspace tar.gz snapshots
 ready_timeout: "20s"
 
 templates:

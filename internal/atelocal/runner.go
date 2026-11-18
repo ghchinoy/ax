@@ -21,8 +21,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 )
+
+const (
+	// RuntimeApple selects the native macOS Apple `container` CLI runtime.
+	RuntimeApple = "apple"
+	// RuntimePodman selects the Podman CLI runtime.
+	RuntimePodman = "podman"
+)
+
+// NormalizeRuntime canonicalizes a runtime name into RuntimeApple or RuntimePodman.
+func NormalizeRuntime(runtime string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(runtime)) {
+	case "", "apple", "apple-container", "container":
+		return RuntimeApple, nil
+	case "podman":
+		return RuntimePodman, nil
+	default:
+		return "", fmt.Errorf("unsupported container runtime %q (want %q or %q)", runtime, RuntimeApple, RuntimePodman)
+	}
+}
 
 // ContainerInspectResult models the JSON structure returned by `container inspect <id>`.
 type ContainerInspectResult struct {
@@ -58,6 +79,18 @@ func CleanIPv4(cidrOrIP string) string {
 	return strings.TrimSpace(parts[0])
 }
 
+// NewContainerRunner returns a ContainerRunner for the specified runtime ("apple" or "podman").
+func NewContainerRunner(runtime, binPath string) (ContainerRunner, error) {
+	norm, err := NormalizeRuntime(runtime)
+	if err != nil {
+		return nil, err
+	}
+	if norm == RuntimePodman {
+		return NewPodmanContainerRunner(binPath), nil
+	}
+	return NewDefaultContainerRunner(binPath), nil
+}
+
 // NewDefaultContainerRunner creates a ContainerRunner that calls the Apple `container` binary.
 func NewDefaultContainerRunner(binPath string) ContainerRunner {
 	if binPath == "" {
@@ -68,6 +101,18 @@ func NewDefaultContainerRunner(binPath string) ContainerRunner {
 		}
 	}
 	return &defaultContainerRunner{binaryPath: binPath}
+}
+
+// NewPodmanContainerRunner creates a ContainerRunner backed by the `podman` CLI.
+func NewPodmanContainerRunner(binPath string) ContainerRunner {
+	if binPath == "" {
+		if p, err := exec.LookPath("podman"); err == nil {
+			binPath = p
+		} else {
+			binPath = "podman"
+		}
+	}
+	return &podmanContainerRunner{binaryPath: binPath}
 }
 
 type defaultContainerRunner struct {
@@ -143,4 +188,195 @@ func (r *defaultContainerRunner) Inspect(ctx context.Context, containerName stri
 		return nil, fmt.Errorf("container %q not found in inspect output", containerName)
 	}
 	return &results[0], nil
+}
+
+type podmanContainerRunner struct {
+	binaryPath string
+}
+
+// translatePodmanArgs converts Apple `container` CLI arguments to `podman` CLI arguments.
+func translatePodmanArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	switch args[0] {
+	case "delete":
+		out := make([]string, len(args))
+		copy(out, args)
+		out[0] = "rm"
+		return out
+	case "run":
+		out := make([]string, 0, len(args)+2)
+		out = append(out, "run")
+		hasPublish := false
+		for i := 1; i < len(args); i++ {
+			a := args[i]
+			if a == "--progress" && i+1 < len(args) {
+				i++
+				continue
+			}
+			if strings.HasPrefix(a, "--progress=") {
+				continue
+			}
+			if a == "--init-image" && i+1 < len(args) {
+				i++
+				continue
+			}
+			if strings.HasPrefix(a, "--init-image=") {
+				continue
+			}
+			if a == "-p" || a == "--publish" || strings.HasPrefix(a, "-p=") || strings.HasPrefix(a, "--publish=") {
+				hasPublish = true
+			}
+			out = append(out, a)
+		}
+		if !hasPublish {
+			withPort := make([]string, 0, len(out)+2)
+			withPort = append(withPort, "run", "-p", "127.0.0.1::80")
+			withPort = append(withPort, out[1:]...)
+			out = withPort
+		}
+		return out
+	default:
+		out := make([]string, len(args))
+		copy(out, args)
+		return out
+	}
+}
+
+func (r *podmanContainerRunner) Run(ctx context.Context, args ...string) (string, error) {
+	podmanArgs := translatePodmanArgs(args)
+	cmd := exec.CommandContext(ctx, r.binaryPath, podmanArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("podman %s failed: %w (stderr: %s)", strings.Join(podmanArgs, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+type podmanInspectEntry struct {
+	ID    string `json:"Id"`
+	State struct {
+		Status  string `json:"Status"`
+		Running bool   `json:"Running"`
+	} `json:"State"`
+	NetworkSettings struct {
+		IPAddress string `json:"IPAddress"`
+		Ports     map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"Ports"`
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+			Gateway   string `json:"Gateway"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
+}
+
+func parsePodmanInspect(raw string, containerName string) (*ContainerInspectResult, error) {
+	var entries []podmanInspectEntry
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse podman inspect json: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("container %q not found in podman inspect output", containerName)
+	}
+	e := entries[0]
+	res := &ContainerInspectResult{
+		ID: e.ID,
+	}
+	res.Configuration.ID = e.ID
+	state := strings.ToLower(strings.TrimSpace(e.State.Status))
+	if state == "" && e.State.Running {
+		state = "running"
+	}
+	res.Status.State = state
+
+	// Prefer published host port so macOS callers can reach into the Podman Machine VM via 127.0.0.1:<hostPort>.
+	portKeys := make([]string, 0, len(e.NetworkSettings.Ports))
+	for k := range e.NetworkSettings.Ports {
+		portKeys = append(portKeys, k)
+	}
+	sort.Slice(portKeys, func(i, j int) bool {
+		if portKeys[i] == "80/tcp" {
+			return true
+		}
+		if portKeys[j] == "80/tcp" {
+			return false
+		}
+		return portKeys[i] < portKeys[j]
+	})
+
+	var routedAddr string
+	for _, key := range portKeys {
+		bindings := e.NetworkSettings.Ports[key]
+		parts := strings.SplitN(key, "/", 2)
+		cPort, _ := strconv.Atoi(parts[0])
+		proto := "tcp"
+		if len(parts) == 2 && parts[1] != "" {
+			proto = parts[1]
+		}
+		for _, b := range bindings {
+			hPort, _ := strconv.Atoi(b.HostPort)
+			if hPort <= 0 {
+				continue
+			}
+			hostIP := strings.TrimSpace(b.HostIP)
+			if hostIP == "" || hostIP == "0.0.0.0" || hostIP == "::" {
+				hostIP = "127.0.0.1"
+			}
+			res.Configuration.PublishedPorts = append(res.Configuration.PublishedPorts, struct {
+				HostAddress   string `json:"hostAddress"`
+				HostPort      int    `json:"hostPort"`
+				ContainerPort int    `json:"containerPort"`
+				Proto         string `json:"proto"`
+			}{
+				HostAddress:   hostIP,
+				HostPort:      hPort,
+				ContainerPort: cPort,
+				Proto:         proto,
+			})
+			if routedAddr == "" {
+				routedAddr = fmt.Sprintf("%s:%d", hostIP, hPort)
+			}
+		}
+	}
+
+	if routedAddr == "" {
+		routedAddr = CleanIPv4(e.NetworkSettings.IPAddress)
+	}
+	if routedAddr == "" {
+		netNames := make([]string, 0, len(e.NetworkSettings.Networks))
+		for n := range e.NetworkSettings.Networks {
+			netNames = append(netNames, n)
+		}
+		sort.Strings(netNames)
+		for _, n := range netNames {
+			if ip := CleanIPv4(e.NetworkSettings.Networks[n].IPAddress); ip != "" {
+				routedAddr = ip
+				break
+			}
+		}
+	}
+	if routedAddr != "" {
+		res.Status.Networks = append(res.Status.Networks, struct {
+			Hostname    string `json:"hostname"`
+			IPv4Address string `json:"ipv4Address"`
+			IPv4Gateway string `json:"ipv4Gateway"`
+		}{
+			Hostname:    containerName,
+			IPv4Address: routedAddr,
+		})
+	}
+	return res, nil
+}
+
+func (r *podmanContainerRunner) Inspect(ctx context.Context, containerName string) (*ContainerInspectResult, error) {
+	out, err := r.Run(ctx, "inspect", containerName)
+	if err != nil {
+		return nil, err
+	}
+	return parsePodmanInspect(out, containerName)
 }

@@ -75,8 +75,37 @@ make local-down
 | `local-stack.sh status` | Shows each component, its PID and port, and any `ate-*` actor containers. |
 | `local-stack.sh logs [component]` | Follows `.ax-local/logs/*.log`, or `container logs` for `postgres`. |
 | `local-stack.sh reset` | `down`, removes leftover actor containers, then `up`. |
+| `local-stack.sh multi-up` | Starts a dual-cluster AX+Substrate topology: Cluster A on Apple `container` (`:8090` / `:50051`) and Cluster B on `podman` (`:8091` / `:50052`), sharing `.ax-local/snapshots/`. |
+| `local-stack.sh migrate <task> [atespace]` | Suspends `<task>` on Cluster A (snapshotting `/workspace`), exports & applies the task manifest to Cluster B, and resumes it on Cluster B (hydrating `/workspace`). |
 
 Ports default to PostgreSQL `5432`, `ate-local` `50051` and `ax-server` `8090`. Override them with `AX_LOCAL_POSTGRES_PORT`, `AX_LOCAL_SUBSTRATE_PORT` and `AX_LOCAL_SERVER_PORT`. State (binaries, logs, PID files, generated config) goes in `.ax-local/`, or `AX_LOCAL_DIR`.
+
+---
+
+## Multi-Cluster Task Mobility (Apple `container` $\leftrightarrow$ `podman`)
+
+`ate-local` supports both **Apple `container`** (`runtime: apple`) and **Podman** (`runtime: podman`), plus `/workspace` snapshot persistence (`snapshot_dir`) across `SuspendActor` and `ResumeActor`.
+
+- **Cluster A (`apple`):** Spawns native Apple containers (`ate-apple-...`) with `vmnet` IPs (`192.168.64.x`).
+- **Cluster B (`podman`):** Spawns Podman containers (`ate-podman-...`), publishes the guest port to `127.0.0.1:<ephemeralPort>`, and returns `127.0.0.1:<ephemeralPort>` in `WorkerPodIps`.
+- **Workspace Snapshots:** On `SuspendActor`, `ate-local` archives `/workspace` into `<snapshot_dir>/<atespace>/<actor>.tar.gz`. When the task is resumed on another cluster sharing `<snapshot_dir>`, `ate-local` hydrates `/workspace` from that snapshot before marking the actor running.
+
+```bash
+make local-multi-up                 # or: examples/ate_local/local-stack.sh multi-up
+source .ax-local/env
+
+# 1. Start task on Cluster A (Apple container) and write state to /workspace
+ax --server $AX_SERVER_A apply -f examples/ate_local/task-local.yaml
+ax --server $AX_SERVER_A resume local-task
+ax --server $AX_SERVER_A ssh local-task -- sh -c 'echo "step 1 from apple container" > /workspace/progress.txt'
+
+# 2. Migrate task from Cluster A (:8090) to Cluster B (:8091)
+./examples/ate_local/local-stack.sh migrate local-task
+
+# 3. Verify task is running on Cluster B with /workspace state preserved
+ax --server $AX_SERVER_B describe task local-task
+ax --server $AX_SERVER_B ssh local-task -- cat /workspace/progress.txt
+```
 
 ### What AX needs from PostgreSQL and `ate-local`
 
