@@ -11,3 +11,6 @@ bin/
 .vscode/
 /claude-code-runner
 ax-claude-code-runner
+
+# Local AX stack state (examples/ate_local/local-stack.sh)
+.ax-local/

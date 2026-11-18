@@ -51,9 +51,28 @@ It allows upstream `ax` (and other Substrate clients) to run agent harnesses ins
 
 ---
 
-## Quickstart Demo
+## Full AX Stack Quickstart
 
-Run the automated demo:
+To run real AX Tasks (`ax apply`, `ax resume`, `ax ssh`) against Apple containers, start the whole stack: Valkey, `ate-local`, `ax-controller` and `ax-server`.
+
+```bash
+make local-up
+source .ax-local/env
+
+ax apply -f examples/ate_local/task-local.yaml
+ax resume local-task
+ax describe task local-task
+ax ssh local-task -- uname -sm
+ax delete task local-task
+
+make local-down
+```
+
+See [docs/ate-local.md](../../docs/ate-local.md) for the helper's commands, what AX needs from Redis, and troubleshooting.
+
+## Control Plane Demo
+
+To exercise only `ate-local`'s Control API, run the automated demo:
 
 ```bash
 ./examples/ate_local/run_demo.sh
@@ -71,7 +90,7 @@ go build -o bin/ate-local ./cmd/ate-local
 ### 2. Run an Actor turn
 
 ```bash
-go run ./examples/ate_local/demo_client.go --actor my-test-actor --input "Hello Substrate!"
+go run ./examples/ate_local/demo_client.go --actor my-test-actor
 ```
 
 ---

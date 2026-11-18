@@ -48,7 +48,7 @@ CONTAINER_CLI ?= $(shell command -v container 2>/dev/null || command -v podman 2
 BUF := go tool -modfile=hack/tools/buf/go.mod buf
 GOLANGCI_LINT := go tool -modfile=hack/tools/golangci-lint/go.mod golangci-lint
 
-.PHONY: build install images push-runner-volume check-image-repo build-claude-code-image push-claude-code-image generate deploy deploy-server deploy-postgres apply-example verify test test-e2e e2e-setup e2e-run e2e-cleanup clean build-ate-local run-ate-local
+.PHONY: build install images push-runner-volume check-image-repo build-claude-code-image push-claude-code-image generate deploy deploy-server deploy-postgres apply-example verify test test-e2e e2e-setup e2e-run e2e-cleanup clean build-ate-local run-ate-local local-up local-down local-status local-logs local-reset
 
 ## --------------------------------------
 ## Build Targets
@@ -70,6 +70,23 @@ build-ate-local:
 run-ate-local: build-ate-local
 	@echo "==> Running ate-local daemon..."
 	./bin/ate-local --config examples/ate_local/ate-local.yaml
+
+# Full local AX stack on macOS (Valkey, ate-local, ax-controller, ax-server)
+# backed by Apple container. See docs/ate-local.md.
+local-up:
+	./examples/ate_local/local-stack.sh up
+
+local-down:
+	./examples/ate_local/local-stack.sh down
+
+local-status:
+	./examples/ate_local/local-stack.sh status
+
+local-logs:
+	./examples/ate_local/local-stack.sh logs
+
+local-reset:
+	./examples/ate_local/local-stack.sh reset
 
 # Install the ax CLI into $(go env GOPATH)/bin
 install:
