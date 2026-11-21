@@ -25,6 +25,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -210,5 +213,74 @@ func TestEnsureServerURLUsesKubectlResolver(t *testing.T) {
 	})
 	if !called || !errors.Is(err, want) {
 		t.Fatalf("EnsureServerURL() called resolver = %v, error = %v; want the resolver's error", called, err)
+	}
+}
+
+func TestPortForwardDrainsPipeAndReapsChild(t *testing.T) {
+	// Simulate kubectl port-forward printing both IPv4 and IPv6 banners followed
+	// by >256 KiB of "Handling connection for ..." lines (exceeding the 64 KiB OS
+	// pipe buffer), recording its PID, and marking completion once all writes
+	// finish without blocking.
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "kubectl.pid")
+	doneFile := filepath.Join(dir, "writes.done")
+	fakeKubectl := filepath.Join(dir, "kubectl")
+	script := fmt.Sprintf(`#!/bin/sh
+echo $$ > %q
+echo "Forwarding from 127.0.0.1:42424 -> 443"
+echo "Forwarding from [::1]:42424 -> 443"
+i=0
+while [ $i -lt 6000 ]; do
+  echo "Handling connection for 42424: stream frame $i padding-0123456789abcdef"
+  i=$((i + 1))
+done
+echo ok > %q
+exec sleep 30
+`, pidFile, doneFile)
+	if err := os.WriteFile(fakeKubectl, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	port, cleanup, err := PortForward(
+		context.Background(),
+		func(context.Context) (string, error) { return fakeKubectl, nil },
+		"kind-local",
+		"ate-system",
+		"svc/atenet-router",
+		443,
+	)
+	if err != nil {
+		t.Fatalf("PortForward() error = %v", err)
+	}
+	defer cleanup()
+	if port != 42424 {
+		t.Fatalf("PortForward() port = %d, want 42424", port)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(doneFile); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("kubectl stdout/stderr pipe blocked before finishing 256 KiB of connection logs")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("reading kubectl pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid pid %q: %v", string(pidBytes), err)
+	}
+
+	// Idempotent cleanup terminates and reaps the child process.
+	cleanup()
+	cleanup()
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Errorf("expected reaped kubectl process %d to return ESRCH after cleanup, got %v", pid, err)
 	}
 }

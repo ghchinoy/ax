@@ -25,6 +25,8 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -1128,14 +1130,40 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string)
 	}
 
 	targetActor := fmt.Sprintf("%s/%s", task.GetMetadata().GetAtespace(), actor)
-	guestClient, cleanup, err := dialGuest(targetActor, kubeContext, axNamespace)
+	sshCtx, cancelSSH := context.WithCancel(context.Background())
+	defer cancelSSH()
+
+	// Catch interrupts during router TLS / port-forward setup so Ctrl-C cancels
+	// sshCtx and cleans up any spawned kubectl child instead of leaving it orphaned.
+	setupSigs := make(chan os.Signal, 2)
+	signal.Notify(setupSigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	setupDone := make(chan struct{})
+	go func() {
+		select {
+		case <-setupSigs:
+			cancelSSH()
+		case <-setupDone:
+		}
+	}()
+
+	guestClient, cleanup, err := dialGuest(sshCtx, targetActor, kubeContext, axNamespace)
+	signal.Stop(setupSigs)
+	close(setupDone)
 	if err != nil {
 		return err
 	}
-	if cleanup != nil {
-		defer cleanup()
+
+	var closeOnce sync.Once
+	teardownSSH := func() {
+		closeOnce.Do(func() {
+			cancelSSH()
+			_ = guestClient.Close()
+			if cleanup != nil {
+				cleanup()
+			}
+		})
 	}
-	defer guestClient.Close()
+	defer teardownSSH()
 
 	// A bare shell on a terminal runs with -i, so it prompts and Ctrl-C stops the
 	// command it is running rather than the shell itself.
@@ -1144,18 +1172,20 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string)
 	}
 
 	// Ctrl-C is passed on to the remote command instead of ending ax ssh. Pressing
-	// it twice in quick succession gives up on the session and exits locally, so
-	// a hung connection never traps the terminal.
+	// it twice in quick succession (or receiving SIGTERM/SIGHUP) tears down the
+	// guest stream and port-forward child before exiting locally, so a hung
+	// connection neither traps the terminal nor leaks background processes.
 	rawSigs := make(chan os.Signal, 4)
-	signal.Notify(rawSigs, os.Interrupt)
+	signal.Notify(rawSigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(rawSigs)
 	sigs := escalateInterrupts(rawSigs, interruptExitWindow, func() {
-		fmt.Fprintln(os.Stderr, "\nax ssh: interrupted twice, exiting")
-		activeTrace.endWithin(errors.New("ax ssh: interrupted twice"), interruptFlushTimeout)
+		fmt.Fprintln(os.Stderr, "\nax ssh: interrupted, exiting")
+		teardownSSH()
+		activeTrace.endWithin(errors.New("ax ssh: interrupted"), interruptFlushTimeout)
 		os.Exit(130)
 	})
 
-	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
+	exitCode, err := guestClient.Exec(sshCtx, guest.ExecOptions{
 		Command: cmdToRun,
 		Stdin:   os.Stdin,
 		Stdout:  os.Stdout,
@@ -1173,7 +1203,7 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string)
 	return nil
 }
 
-func dialGuest(targetActor, kubeContext, axNamespace string) (*guest.Client, func(), error) {
+func dialGuest(ctx context.Context, targetActor, kubeContext, axNamespace string) (*guest.Client, func(), error) {
 	// 1. Connect directly to ATENET_ROUTER_ADDR when set (e.g. in-cluster).
 	if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
 		addr := strings.TrimPrefix(strings.TrimPrefix(routerAddr, "http://"), "https://")
@@ -1188,15 +1218,18 @@ func dialGuest(targetActor, kubeContext, axNamespace string) (*guest.Client, fun
 	if axNamespace == "" {
 		axNamespace = v1alpha1.DefaultSystemNamespace
 	}
-	client, cleanup, setupErr, dialErr := dialRouterTLS(targetActor, kubeContext, axNamespace)
+	client, cleanup, setupErr, dialErr := dialRouterTLS(ctx, targetActor, kubeContext, axNamespace)
 	if dialErr != nil {
 		return nil, nil, dialErr
 	}
 	if client != nil {
 		return client, cleanup, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 
-	localPort, cleanup, err := tunnel.PortForward(context.Background(), ensureKubectl, kubeContext, "ate-system", "svc/atenet-router", 80)
+	localPort, cleanup, err := tunnel.PortForward(ctx, ensureKubectl, kubeContext, "ate-system", "svc/atenet-router", 80)
 	if err != nil {
 		return nil, nil, fmt.Errorf("establishing port-forward to atenet-router: %w (%v)", err, setupErr)
 	}
@@ -1209,12 +1242,14 @@ func dialGuest(targetActor, kubeContext, axNamespace string) (*guest.Client, fun
 	return client, cleanup, nil
 }
 
-func dialRouterTLS(targetActor, kubeContext, axNamespace string) (client *guest.Client, cleanup func(), setupErr, dialErr error) {
-	tlsCfg, err := tunnel.RouterTLSConfig(context.Background(), ensureKubectl, kubeContext, axNamespace, "ax-server")
+func dialRouterTLS(ctx context.Context, targetActor, kubeContext, axNamespace string) (client *guest.Client, cleanup func(), setupErr, dialErr error) {
+	tlsCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	tlsCfg, err := tunnel.RouterTLSConfig(tlsCtx, ensureKubectl, kubeContext, axNamespace, "ax-server")
 	if err != nil {
 		return nil, nil, fmt.Errorf("mTLS setup error: %w", err), nil
 	}
-	localPort, cleanup, err := tunnel.PortForward(context.Background(), ensureKubectl, kubeContext, "ate-system", "svc/atenet-router", 443)
+	localPort, cleanup, err := tunnel.PortForward(ctx, ensureKubectl, kubeContext, "ate-system", "svc/atenet-router", 443)
 	if err != nil {
 		return nil, nil, fmt.Errorf("port 443 forward error: %w", err), nil
 	}
@@ -1232,14 +1267,22 @@ func dialRouterTLS(targetActor, kubeContext, axNamespace string) (client *guest.
 const interruptExitWindow = time.Second
 
 // escalateInterrupts relays each signal from in to the returned channel, except
-// that a signal arriving within window of the previous one calls exit instead.
-// This keeps a single Ctrl-C going to the remote command while a repeated one
-// still works as an escape hatch.
+// that a second interrupt arriving within window of the previous one—or any
+// SIGTERM/SIGHUP—calls exit instead. This keeps a single Ctrl-C going to the
+// remote command while a repeated one or terminal hangup always exits cleanly.
 func escalateInterrupts(in <-chan os.Signal, window time.Duration, exit func()) <-chan os.Signal {
 	out := make(chan os.Signal, 1)
 	go func() {
 		var last time.Time
 		for sig := range in {
+			if sig == syscall.SIGTERM || sig == syscall.SIGHUP {
+				select {
+				case out <- sig:
+				default:
+				}
+				exit()
+				return
+			}
 			now := time.Now()
 			if !last.IsZero() && now.Sub(last) < window {
 				exit()

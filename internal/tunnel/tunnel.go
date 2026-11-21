@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -460,39 +461,61 @@ func PortForward(ctx context.Context, kubectl KubectlResolver, kubeContext, name
 	// Close the parent's write end so pr.Read observes EOF as soon as kubectl exits.
 	_ = pw.Close()
 
+	waitDone := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waitDone)
+	}()
+
 	portChan := make(chan int, 1)
 	errChan := make(chan error, 1)
 
+	// Keep draining pr for the entire lifetime of kubectl port-forward. Stopping
+	// after the initial banner would let "Handling connection for ..." lines fill
+	// the OS pipe buffer and block kubectl mid-session.
+	const maxPortForwardBannerBytes = 8 << 10
 	go func() {
 		buf := make([]byte, 1024)
 		var output strings.Builder
+		portSent := false
 		for {
 			n, err := pr.Read(buf)
-			if n > 0 {
-				output.Write(buf[:n])
+			if n > 0 && !portSent {
+				if output.Len() < maxPortForwardBannerBytes {
+					output.Write(buf[:n])
+				}
 				if match := portForwardRegex.FindStringSubmatch(output.String()); len(match) > 1 {
-					p, convErr := strconv.Atoi(match[1])
-					if convErr == nil && p > 0 {
+					if p, convErr := strconv.Atoi(match[1]); convErr == nil && p > 0 {
+						portSent = true
 						portChan <- p
 					}
 				}
 			}
 			if err != nil {
-				select {
-				case errChan <- fmt.Errorf("kubectl port-forward exited: %s", strings.TrimSpace(output.String())):
-				default:
+				if !portSent {
+					select {
+					case errChan <- fmt.Errorf("kubectl port-forward exited: %s", strings.TrimSpace(output.String())):
+					default:
+					}
 				}
 				return
 			}
 		}
 	}()
 
+	var cleanOnce sync.Once
 	cleanup := func() {
-		_ = pr.Close()
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-			_ = cmd.Process.Kill()
-		}
+		cleanOnce.Do(func() {
+			_ = pr.Close()
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+				_ = cmd.Process.Kill()
+				select {
+				case <-waitDone:
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		})
 	}
 
 	select {

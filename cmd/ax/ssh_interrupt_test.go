@@ -16,6 +16,7 @@ package main
 
 import (
 	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -62,5 +63,28 @@ func TestEscalateInterruptsSlowSecondIsForwarded(t *testing.T) {
 	case <-out:
 	case <-time.After(2 * time.Second):
 		t.Fatal("second interrupt outside the window was not forwarded")
+	}
+}
+
+func TestEscalateInterruptsExitsImmediatelyOnSIGTERMAndSIGHUP(t *testing.T) {
+	for _, sig := range []os.Signal{syscall.SIGTERM, syscall.SIGHUP} {
+		in := make(chan os.Signal, 1)
+		exited := make(chan struct{})
+		out := escalateInterrupts(in, time.Minute, func() { close(exited) })
+
+		in <- sig
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%v did not trigger exit", sig)
+		}
+		select {
+		case got := <-out:
+			if got != sig {
+				t.Errorf("forwarded signal = %v, want %v", got, sig)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%v was not forwarded before exit", sig)
+		}
 	}
 }

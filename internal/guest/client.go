@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -56,7 +57,16 @@ func DialTLS(target string, targetActor string, tlsConfig *tls.Config) (*Client,
 	if tlsConfig != nil {
 		creds = credentials.NewTLS(tlsConfig)
 	}
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	dialOpts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		// Detect dead port-forward or router streams during active Exec calls
+		// without sending pings while idle.
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	}
 	if targetActor != "" {
 		dialOpts = append(dialOpts,
 			grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
