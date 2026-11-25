@@ -9,3 +9,6 @@ bin/
 /ax-runner
 
 .vscode/
+
+# Local AX stack state (examples/ate_local/local-stack.sh)
+.ax-local/

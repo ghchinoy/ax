@@ -1,0 +1,60 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -e
+
+echo "=== ate-local: Local Agent Substrate on Apple Container Demo ==="
+
+# Check if container CLI is installed
+if ! command -v container &> /dev/null; then
+    echo "Error: Apple 'container' CLI tool not found in PATH."
+    exit 1
+fi
+
+DAEMON_PID=""
+cleanup() {
+    echo "Cleaning up..."
+    # Only stop the ate-local this script started.
+    if [ -n "$DAEMON_PID" ]; then
+        kill "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+echo "1. Building ate-local daemon and linux/arm64 worker..."
+mkdir -p bin/linux_arm64
+go build -o bin/ate-local ./cmd/ate-local
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux_arm64/ate-worker ./examples/ate_local/worker/main.go
+
+echo "2. Checking that port 50051 is free..."
+if OWNER_PID=$(lsof -nP -t -iTCP:50051 -sTCP:LISTEN 2>/dev/null | head -n1) && [ -n "$OWNER_PID" ]; then
+    echo "Error: port 50051 is in use by $(ps -p "$OWNER_PID" -o comm=) (pid $OWNER_PID)."
+    echo "If it is the local stack, run: examples/ate_local/local-stack.sh down"
+    exit 1
+fi
+
+echo "3. Starting ate-local daemon in background..."
+./bin/ate-local --config examples/ate_local/ate-local.yaml &
+DAEMON_PID=$!
+
+echo "Waiting for ate-local to listen on :50051..."
+for _ in $(seq 1 50); do
+    nc -z 127.0.0.1 50051 >/dev/null 2>&1 && break
+    sleep 0.2
+done
+
+echo "4. Running Substrate Control client demo..."
+go run ./examples/ate_local/demo_client.go --actor demo-actor-live --template ax-harness-demo-template
