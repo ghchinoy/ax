@@ -237,6 +237,9 @@ func EnsureServerURL(ctx context.Context, opts Options) (string, error) {
 		}
 		return "", ErrNoContext
 	}
+	if ep, err := GetLocalEndpoint(ctxName); err == nil && ep != nil && ep.ServerURL != "" {
+		return ep.ServerURL, nil
+	}
 
 	if opts.Namespace == "" {
 		if opts.FromEnv {

@@ -1174,8 +1174,13 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string)
 }
 
 func dialGuest(targetActor, kubeContext, axNamespace string) (*guest.Client, func(), error) {
-	// 1. Connect directly to ATENET_ROUTER_ADDR when set (e.g. in-cluster).
-	if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
+	// 1. Connect directly to ATENET_ROUTER_ADDR when set (e.g. in-cluster),
+	// or to the router recorded for an active non-K8s local backend (ate-local).
+	routerAddr := os.Getenv("ATENET_ROUTER_ADDR")
+	if routerAddr == "" {
+		routerAddr = tunnel.LocalEndpointRouter(kubeContext)
+	}
+	if routerAddr != "" {
 		addr := strings.TrimPrefix(strings.TrimPrefix(routerAddr, "http://"), "https://")
 		client, err := guest.Dial(addr, targetActor)
 		if err != nil {

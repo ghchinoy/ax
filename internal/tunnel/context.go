@@ -114,17 +114,21 @@ func kubectlIfInstalled() string {
 	return ""
 }
 
-// CurrentContext returns the active Kubernetes context, checking:
+// CurrentContext returns the active AX context, checking:
 // 1. Explicitly passed override
 // 2. KUBECONTEXT environment variable
-// 3. ~/.kube/config (or $KUBECONFIG) current-context (fast parse via YAML)
-// 4. Fallback to 'kubectl config current-context'
+// 3. Active non-K8s local endpoint ($AX_HOME/current-context)
+// 4. ~/.kube/config (or $KUBECONFIG) current-context (fast parse via YAML)
+// 5. Fallback to 'kubectl config current-context'
 func CurrentContext(override string) (string, error) {
 	if override != "" {
 		return override, nil
 	}
 	if env := os.Getenv("KUBECONTEXT"); env != "" {
 		return env, nil
+	}
+	if localCtx := ActiveLocalContext(); localCtx != "" {
+		return localCtx, nil
 	}
 	if ctx, parsed := readCurrentContext(kubeconfigPaths()); parsed {
 		return ctx, nil
@@ -199,6 +203,23 @@ func ListContexts(overrideCurrent string) ([]ContextEntry, error) {
 		}
 	}
 
+	if eps, err := ListLocalEndpoints(); err == nil {
+		for _, ep := range eps {
+			if _, exists := seen[ep.Name]; !exists {
+				backend := ep.Backend
+				if backend == "" {
+					backend = "local"
+				}
+				seen[ep.Name] = ContextEntry{
+					Name:    ep.Name,
+					Cluster: fmt.Sprintf("%s (%s)", backend, ep.ServerURL),
+					User:    "local",
+					Current: ep.Name == active,
+				}
+			}
+		}
+	}
+
 	out := make([]ContextEntry, 0, len(seen))
 	for _, entry := range seen {
 		out = append(out, entry)
@@ -207,16 +228,21 @@ func ListContexts(overrideCurrent string) ([]ContextEntry, error) {
 	return out, nil
 }
 
-// SetCurrentContext switches `current-context` in kubeconfig to target. When
-// kubectl is already installed locally it delegates to `kubectl config
-// use-context`; otherwise it validates and updates kubeconfig directly in Go so
-// switching contexts works offline (and in hermetic unit tests) without
-// downloading kubectl.
+// SetCurrentContext switches the active AX context to target. If target names a
+// saved non-K8s local endpoint, it activates that endpoint in $AX_HOME without
+// touching kubeconfig; otherwise it clears any active local endpoint selection
+// and switches kubeconfig `current-context`.
 func SetCurrentContext(target string) error {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return fmt.Errorf("context name must not be empty")
 	}
+	if ep, err := GetLocalEndpoint(target); err != nil {
+		return err
+	} else if ep != nil {
+		return SetActiveLocalContext(ep.Name)
+	}
+	_ = ClearActiveLocalContext()
 	if kubectlBin := kubectlIfInstalled(); kubectlBin != "" {
 		out, err := exec.Command(kubectlBin, "config", "use-context", target).CombinedOutput()
 		if err != nil {

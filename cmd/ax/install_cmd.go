@@ -31,7 +31,7 @@ import (
 	"github.com/google/ax/internal/install/axdeploy"
 	"github.com/google/ax/internal/install/cluster"
 	"github.com/google/ax/internal/install/executil"
-	installsubstrate "github.com/google/ax/internal/install/substrate"
+	installlocal "github.com/google/ax/internal/install/local"
 )
 
 func formatImageFlagDefault(def, envVar string, required bool) string {
@@ -57,8 +57,13 @@ Subcommands:
   delete   Destroy the local cluster and clean up its context
 
 Flags:
+  --backend string             Local backend: "kind" (default) or "ate-local" (zero-Kubernetes Apple container / Podman)
   --name string                Local cluster name (default: %q)
-  --workers int                Number of gVisor worker replicas (default: 1)
+  --workers int                Number of gVisor worker replicas (default: 1; kind backend)
+  --runtime string             Container runtime for ate-local backend: "apple" or "podman"
+  --server-port int            ax-server loopback port for ate-local backend (default: 8090 or free port)
+  --substrate-port int         ate-local loopback port for ate-local backend (default: 50051 or free port)
+  --postgres-port int          PostgreSQL loopback port for ate-local backend (default: 5432 or free port)
   --server-image string        ax-server image reference, tag or @sha256 %s
   --runner-volume-image string Runner volume image mounted into tasks; empty runs each image's own runner %s
   -o, --output string          Output format of status; "json" also reports the container host
@@ -112,11 +117,16 @@ func (f *imageFlags) register(fs *flag.FlagSet) {
 
 type localFlags struct {
 	imageFlags
-	subcmd  string
-	name    string
-	workers int
-	output  string
-	help    bool
+	subcmd        string
+	backend       string
+	name          string
+	workers       int
+	runtime       string
+	serverPort    int
+	substratePort int
+	postgresPort  int
+	output        string
+	help          bool
 }
 
 func parseLocalArgs(args []string) (localFlags, error) {
@@ -132,8 +142,13 @@ func parseLocalArgs(args []string) (localFlags, error) {
 	fs.SetOutput(io.Discard)
 
 	out := localFlags{subcmd: subcmd}
+	fs.StringVar(&out.backend, "backend", "", "local backend: kind (default) or ate-local")
 	fs.StringVar(&out.name, "name", cluster.DefaultName, "local cluster name")
 	fs.IntVar(&out.workers, "workers", 1, "worker replicas")
+	fs.StringVar(&out.runtime, "runtime", "", "container runtime for ate-local backend (apple or podman)")
+	fs.IntVar(&out.serverPort, "server-port", 0, "ax-server loopback port for ate-local backend")
+	fs.IntVar(&out.substratePort, "substrate-port", 0, "ate-local loopback port for ate-local backend")
+	fs.IntVar(&out.postgresPort, "postgres-port", 0, "PostgreSQL loopback port for ate-local backend")
 	out.register(fs)
 	fs.StringVar(&out.output, "o", "", "output format of status: json")
 	fs.StringVar(&out.output, "output", "", "output format of status: json")
@@ -146,6 +161,13 @@ func parseLocalArgs(args []string) (localFlags, error) {
 	if fs.NArg() > 0 {
 		return localFlags{}, fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
+	if out.backend != "" {
+		norm, err := installlocal.NormalizeBackend(out.backend)
+		if err != nil {
+			return localFlags{}, err
+		}
+		out.backend = norm
+	}
 	if out.output != "" && out.output != "json" {
 		return localFlags{}, fmt.Errorf("unsupported output format %q (expected: json)", out.output)
 	}
@@ -153,6 +175,22 @@ func parseLocalArgs(args []string) (localFlags, error) {
 		return localFlags{}, fmt.Errorf("-o is only supported by 'ax local status'")
 	}
 	return out, nil
+}
+
+func resolveLocalBackend(parsed localFlags, axNamespace string, out io.Writer) (installlocal.Backend, *installlocal.KindBackend) {
+	chosen := parsed.backend
+	if chosen == "" {
+		if parsed.subcmd != "start" && installlocal.HasAteLocalState(parsed.name) {
+			chosen = installlocal.BackendAteLocal
+		} else {
+			chosen = installlocal.BackendKind
+		}
+	}
+	if chosen == installlocal.BackendAteLocal {
+		return installlocal.NewAteLocalBackend(out), nil
+	}
+	kb := installlocal.NewKindBackend(axNamespace, out)
+	return kb, kb
 }
 
 func runLocal(axNamespace string, args []string) error {
@@ -169,74 +207,56 @@ func runLocal(axNamespace string, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	provider := cluster.NewKindProvider(nil, os.Stdout)
-	provider.AXNamespace = axNamespace
+	backend, kindBackend := resolveLocalBackend(parsed, axNamespace, os.Stdout)
 
 	switch parsed.subcmd {
 	case "start":
-		// Fail fast if image inputs are gated before provisioning a Kind cluster.
-		srvImg, runnerImg, err := axdeploy.ResolveImageInputs(parsed.serverImage, parsed.runnerVolumeImage)
-		if err != nil {
-			return err
-		}
-		// The Substrate that Step 2 installs names the registry that serves the
-		// images of localhost to the cluster.
-		localRegistry, err := installsubstrate.LocalRegistryEndpoint()
-		if err != nil {
-			return err
-		}
-		// Step 1: Provision or resume the local Kind cluster and select its kubeconfig context.
-		info, err := provider.Up(ctx, cluster.UpOptions{
-			Name:          parsed.name,
-			Images:        []string{srvImg, runnerImg},
-			LocalRegistry: localRegistry,
+		ep, err := backend.Start(ctx, installlocal.StartOptions{
+			Name:              parsed.name,
+			Workers:           parsed.workers,
+			AXNamespace:       axNamespace,
+			ServerImage:       parsed.serverImage,
+			RunnerVolumeImage: parsed.runnerVolumeImage,
+			Runtime:           parsed.runtime,
+			PostgresPort:      parsed.postgresPort,
+			SubstratePort:     parsed.substratePort,
+			ServerPort:        parsed.serverPort,
 		})
 		if err != nil {
 			return err
 		}
-		// Step 2: Bootstrap Agent Substrate (PKI, mTLS Postgres, control plane, and gVisor workers).
-		if err := installsubstrate.Bootstrap(ctx, installsubstrate.BootstrapOptions{
-			KubeContext:    info.KubeContext,
-			AXNamespace:    axNamespace,
-			WorkerReplicas: parsed.workers,
-			Out:            os.Stdout,
-		}); err != nil {
-			return err
+		if ep.ServerURL != "" {
+			fmt.Printf("\nLocal environment %q is ready (backend: %s, active context: %s, server: %s, router: %s).\n",
+				ep.Name, ep.Backend, ep.KubeContext, ep.ServerURL, ep.RouterAddr)
+		} else {
+			fmt.Printf("\nLocal environment %q is ready (active context: %s).\n", ep.Name, ep.KubeContext)
 		}
-		// Step 3: Resolve AX image digests, register Substrate caller permissions, and deploy AX.
-		if err := axdeploy.Install(ctx, axdeploy.InstallOptions{
-			KubeContext:       info.KubeContext,
-			Namespace:         axNamespace,
-			ServerImage:       srvImg,
-			RunnerVolumeImage: runnerImg,
-			Out:               os.Stdout,
-		}); err != nil {
-			return err
-		}
-		fmt.Printf("\nLocal environment %q is ready (active context: %s).\n", info.Name, info.KubeContext)
 		return nil
 
 	case "status":
 		if parsed.output == "json" {
-			// Tool download progress goes to stderr, so stdout is only the report.
-			provider.Out = os.Stderr
-			return writeLocalStatusJSON(ctx, os.Stdout, provider.Runner, provider, parsed.name)
+			if kindBackend != nil {
+				// Tool download progress goes to stderr, so stdout is only the report.
+				kindBackend.Provider.Out = os.Stderr
+				return writeLocalStatusJSON(ctx, os.Stdout, kindBackend.Provider.Runner, kindBackend.Provider, parsed.name)
+			}
+			return writeAteLocalStatusJSON(ctx, os.Stdout, backend, parsed.name)
 		}
-		st, err := provider.Status(ctx, parsed.name)
+		st, err := backend.Status(ctx, parsed.name)
 		if err != nil {
 			return err
 		}
 		return formatLocalStatus(os.Stdout, st)
 
 	case "stop":
-		if err := provider.Stop(ctx, parsed.name); err != nil {
+		if err := backend.Stop(ctx, parsed.name); err != nil {
 			return err
 		}
 		fmt.Printf("Local cluster %q stopped.\n", parsed.name)
 		return nil
 
 	case "delete":
-		if err := provider.Delete(ctx, parsed.name); err != nil {
+		if err := backend.Delete(ctx, parsed.name); err != nil {
 			return err
 		}
 		fmt.Printf("Local cluster %q deleted.\n", parsed.name)
@@ -246,6 +266,29 @@ func runLocal(axNamespace string, args []string) error {
 		fmt.Fprintln(os.Stderr, localUsage())
 		return fmt.Errorf("unknown subcommand %q (expected: start, stop, status, delete)", parsed.subcmd)
 	}
+}
+
+func writeAteLocalStatusJSON(ctx context.Context, out io.Writer, backend installlocal.Backend, name string) error {
+	st, err := backend.Status(ctx, name)
+	if err != nil {
+		return err
+	}
+	nodes := st.Nodes
+	if nodes == nil {
+		nodes = []string{}
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(localStatusReport{
+		Name:            st.Name,
+		Backend:         st.Backend,
+		State:           st.State,
+		KubeContext:     st.KubeContext,
+		Nodes:           nodes,
+		SubstrateStatus: st.SubstrateStatus,
+		AXStatus:        st.AXStatus,
+		Host:            localHostReport{Runtime: "apple-container"},
+	})
 }
 
 func formatLocalStatus(out io.Writer, st cluster.Status) error {
