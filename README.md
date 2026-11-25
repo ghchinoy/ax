@@ -126,6 +126,7 @@ Want a tour of AX end to end? Run [`./hack/tour.sh`](hack/tour.sh) against the c
 | Guide | Read it to... |
 |---|---|
 | [Local Installer](docs/local_installer.md) | Walk through `ax local`, `ax studio`, `ax ctx`, `ax install`, and promoting tasks unchanged from local Kind to a remote GKE cluster. |
+| [Local Substrate (`ate-local`)](docs/ate-local.md) | Run AX locally on Apple `container` or rootless Podman without Kubernetes, and migrate tasks across clusters. |
 | [AX Studio](https://github.com/agentexecutor/studio#readme) | Set up AX on your computer and start, watch, and shell into tasks from a local web app (`ax studio`). |
 | [Concepts](docs/concepts.md) | Learn what a `Task`, `Workspace`, and `Model` each do, and how a task moves through phases and conditions. |
 | [Manifests](docs/manifests.md) | Write your own YAML, with an annotated example of every kind. |
